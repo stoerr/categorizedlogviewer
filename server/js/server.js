@@ -3,8 +3,195 @@
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
-const CHUNK_SIZE = 64 * 1024; // 64KB default chunk
-const BYTES_PER_PIXEL = 256; // virtual scroll scale
+const { TextDecoder } = require("util");
+const CHUNK_LINES = 400;
+const INDEX_STRIDE = 1000;
+const MAX_CHUNK_BYTES = 512 * 1024;
+const DEFAULT_CHARSET = "utf-8";
+const CHARSET_OPTIONS = [
+  "utf-8",
+  "iso-8859-1",
+  "iso-8859-15",
+  "windows-1252",
+];
+
+function normalizeCharset(value) {
+  if (!value) {
+    return DEFAULT_CHARSET;
+  }
+  const lower = value.toLowerCase();
+  if (CHARSET_OPTIONS.includes(lower)) {
+    return lower;
+  }
+  return DEFAULT_CHARSET;
+}
+
+function buildLineIndex(filePath, verbose) {
+  const state = {
+    offsets: [0],
+    lineCount: 0,
+    ready: false,
+    error: null,
+  };
+
+  let bytesRead = 0;
+  let endsWithNewline = false;
+  const stream = fs.createReadStream(filePath);
+
+  stream.on("data", (buffer) => {
+    for (let i = 0; i < buffer.length; i += 1) {
+      if (buffer[i] === 10) {
+        state.lineCount += 1;
+        if (state.lineCount % INDEX_STRIDE === 0) {
+          state.offsets.push(bytesRead + i + 1);
+        }
+      }
+    }
+    bytesRead += buffer.length;
+    endsWithNewline = buffer[buffer.length - 1] === 10;
+  });
+
+  stream.on("end", () => {
+    if (bytesRead > 0 && !endsWithNewline) {
+      state.lineCount += 1;
+    }
+    state.ready = true;
+  });
+
+  stream.on("error", (err) => {
+    state.error = err;
+    state.ready = true;
+    if (verbose) {
+      process.stderr.write(`[error] ${err.stack || err.message}\n`);
+    }
+  });
+
+  return state;
+}
+
+function getBaseOffset(lineIndex, targetLine) {
+  const strideIndex = Math.max(0, Math.floor(targetLine / INDEX_STRIDE));
+  const safeIndex = Math.min(strideIndex, lineIndex.offsets.length - 1);
+  const baseLine = safeIndex * INDEX_STRIDE;
+  const baseOffset = lineIndex.offsets[safeIndex];
+  return { baseLine, baseOffset };
+}
+
+function getDecoder(charset) {
+  const normalized = normalizeCharset(charset);
+  try {
+    return new TextDecoder(normalized);
+  } catch (err) {
+    return new TextDecoder(DEFAULT_CHARSET);
+  }
+}
+
+function readLineChunk({
+  filePath,
+  lineIndex,
+  startLine,
+  lineCount,
+  charset,
+  verbose,
+}) {
+  if (lineCount <= 0) {
+    return Promise.resolve({ text: "", lines: 0 });
+  }
+
+  if (lineIndex.ready && startLine >= lineIndex.lineCount) {
+    return Promise.resolve({ text: "", lines: 0 });
+  }
+
+  const { baseLine, baseOffset } = getBaseOffset(lineIndex, startLine);
+  const decoder = getDecoder(charset);
+
+  return new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath, { start: baseOffset });
+    const buffers = [];
+    let currentLine = baseLine;
+    let collecting = false;
+    let collectedLines = 0;
+    let totalBytes = 0;
+    let done = false;
+
+    stream.on("data", (buffer) => {
+      if (done) {
+        return;
+      }
+
+      let collectStart = collecting ? 0 : null;
+      let lineStart = 0;
+
+      if (!collecting && currentLine === startLine) {
+        collecting = true;
+        collectStart = 0;
+      }
+
+      for (let i = 0; i < buffer.length; i += 1) {
+        if (buffer[i] !== 10) {
+          continue;
+        }
+
+        if (!collecting && currentLine === startLine) {
+          collecting = true;
+          collectStart = lineStart;
+        }
+
+        if (collecting) {
+          collectedLines += 1;
+          if (collectedLines >= lineCount) {
+            const endIndex = i + 1;
+            if (collectStart !== null && collectStart < endIndex) {
+              buffers.push(buffer.slice(collectStart, endIndex));
+              totalBytes += endIndex - collectStart;
+            }
+            done = true;
+            stream.destroy();
+            return;
+          }
+        }
+
+        currentLine += 1;
+        lineStart = i + 1;
+
+        if (!collecting && currentLine === startLine) {
+          collecting = true;
+          collectStart = lineStart;
+        }
+      }
+
+      if (collecting) {
+        const start = collectStart ?? 0;
+        if (start < buffer.length) {
+          buffers.push(buffer.slice(start));
+          totalBytes += buffer.length - start;
+        }
+      }
+
+      if (totalBytes > MAX_CHUNK_BYTES) {
+        done = true;
+        stream.destroy();
+      }
+    });
+
+    stream.on("error", (err) => {
+      if (verbose) {
+        process.stderr.write(`[error] ${err.stack || err.message}\n`);
+      }
+      reject(err);
+    });
+
+    stream.on("close", () => {
+      if (buffers.length === 0) {
+        resolve({ text: "", lines: 0 });
+        return;
+      }
+      const combined = Buffer.concat(buffers);
+      const text = decoder.decode(combined);
+      resolve({ text, lines: collectedLines });
+    });
+  });
+}
 
 function readTemplate(templatePath, replacements) {
   let html = fs.readFileSync(templatePath, "utf8");
@@ -31,7 +218,7 @@ function serveFile(res, filePath, contentType) {
   }
 }
 
-function start({ port, filePath, wrap, verbose }) {
+function start({ port, filePath, wrap, verbose, charset }) {
   const serverRoot = path.resolve(__dirname, "..", "..");
   const htmlPath = path.join(serverRoot, "server", "html", "index.html");
   const clientPath = path.join(serverRoot, "server", "js", "client.js");
@@ -41,7 +228,10 @@ function start({ port, filePath, wrap, verbose }) {
   const fileSize = stat.size;
   const fileName = path.basename(filePath);
 
-  const server = http.createServer((req, res) => {
+  const lineIndex = buildLineIndex(filePath, verbose);
+  const defaultCharset = normalizeCharset(charset);
+
+  const server = http.createServer(async (req, res) => {
     if (verbose) {
       process.stdout.write(`[request] ${req.method} ${req.url}\n`);
     }
@@ -82,50 +272,50 @@ function start({ port, filePath, wrap, verbose }) {
         const payload = JSON.stringify({
           fileName,
           fileSize,
-          chunkSize: CHUNK_SIZE,
-          bytesPerPixel: BYTES_PER_PIXEL,
+          chunkLines: CHUNK_LINES,
+          lineCount: lineIndex.ready ? lineIndex.lineCount : null,
+          lineCountReady: lineIndex.ready,
+          lineIndexStride: INDEX_STRIDE,
+          charset: defaultCharset,
+          charsetOptions: CHARSET_OPTIONS,
         });
         send(res, 200, payload, "application/json; charset=utf-8");
         return;
       }
 
       if (parsed.pathname === "/api/chunk") {
-        const offset = Number(parsed.searchParams.get("offset") || 0);
-        const length = Number(parsed.searchParams.get("length") || CHUNK_SIZE);
+        const line = Number(parsed.searchParams.get("line") || 0);
+        const lines = Number(parsed.searchParams.get("lines") || CHUNK_LINES);
+        const charsetParam = normalizeCharset(
+          parsed.searchParams.get("charset") || defaultCharset
+        );
 
-        if (Number.isNaN(offset) || Number.isNaN(length)) {
-          send(res, 400, "Invalid offset or length");
+        if (Number.isNaN(line) || Number.isNaN(lines)) {
+          send(res, 400, "Invalid line or lines");
           return;
         }
 
-        const safeOffset = Math.max(0, Math.min(offset, fileSize));
-        const safeLength = Math.max(0, Math.min(length, fileSize - safeOffset));
+        const safeLine = Math.max(0, line);
+        const safeLines = Math.max(1, Math.min(lines, CHUNK_LINES * 2));
 
-        if (safeLength === 0) {
-          send(res, 200, "", "text/plain; charset=utf-8");
+        try {
+          const chunk = await readLineChunk({
+            filePath,
+            lineIndex,
+            startLine: safeLine,
+            lineCount: safeLines,
+            charset: charsetParam,
+            verbose,
+          });
+          send(res, 200, chunk.text, "text/plain; charset=utf-8");
           return;
-        }
-
-        const stream = fs.createReadStream(filePath, {
-          start: safeOffset,
-          end: safeOffset + safeLength - 1,
-          encoding: "utf8",
-        });
-
-        res.writeHead(200, {
-          "Content-Type": "text/plain; charset=utf-8",
-          "Cache-Control": "no-store",
-        });
-
-        stream.on("error", (err) => {
+        } catch (err) {
           if (verbose) {
             process.stderr.write(`[error] ${err.stack || err.message}\n`);
           }
-          res.end("");
-        });
-
-        stream.pipe(res);
-        return;
+          send(res, 500, "Failed to read log");
+          return;
+        }
       }
 
       send(res, 404, "Not found");

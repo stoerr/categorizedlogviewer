@@ -19,6 +19,13 @@
           <div class="fw-semibold text-truncate">{{FILE_NAME}}</div>
           <div class="text-muted small" id="file-meta">Loading metadata...</div>
           <div class="ms-auto d-flex align-items-center gap-3">
+            <div class="d-flex align-items-center gap-2">
+              <label class="small text-muted" for="charset-select">Charset</label>
+              <select
+                id="charset-select"
+                class="form-select form-select-sm charset-select"
+              ></select>
+            </div>
             <div class="form-check form-switch m-0">
               <input class="form-check-input" type="checkbox" id="wrap-toggle" />
               <label class="form-check-label small text-muted" for="wrap-toggle">Wrap</label>

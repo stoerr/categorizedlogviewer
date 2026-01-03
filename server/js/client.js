@@ -7,10 +7,17 @@
   const fileMeta = document.getElementById("file-meta");
   const rangeMeta = document.getElementById("range-meta");
   const wrapToggle = document.getElementById("wrap-toggle");
+  const charsetSelect = document.getElementById("charset-select");
+
+  const ESTIMATED_BYTES_PER_LINE = 80;
 
   let meta = null;
-  let lastOffset = null;
   let pending = false;
+  let lineHeight = 16;
+  let currentRangeStart = 0;
+  let currentRangeEnd = 0;
+  let currentCharset = null;
+  let metaPollTimer = null;
 
   function formatBytes(bytes) {
     if (bytes < 1024) {
@@ -26,52 +33,113 @@
     return `${value.toFixed(1)} ${units[unitIndex]}`;
   }
 
+  function formatLineCount(lines) {
+    if (lines == null) {
+      return "counting lines...";
+    }
+    return `${lines.toLocaleString()} lines`;
+  }
+
+  function countLinesInText(text) {
+    if (!text) {
+      return 0;
+    }
+    let count = 0;
+    for (let i = 0; i < text.length; i += 1) {
+      if (text[i] === "\n") {
+        count += 1;
+      }
+    }
+    if (text[text.length - 1] !== "\n") {
+      count += 1;
+    }
+    return count;
+  }
+
+  function getLineHeightPx() {
+    const style = window.getComputedStyle(logContent);
+    const lineHeightValue = parseFloat(style.lineHeight);
+    if (!Number.isNaN(lineHeightValue)) {
+      return lineHeightValue;
+    }
+    const fontSize = parseFloat(style.fontSize) || 16;
+    return fontSize * 1.4;
+  }
+
+  function getEffectiveLineCount() {
+    if (!meta) {
+      return 1;
+    }
+    if (meta.lineCount != null) {
+      return Math.max(1, meta.lineCount);
+    }
+    return Math.max(1, Math.ceil(meta.fileSize / ESTIMATED_BYTES_PER_LINE));
+  }
+
   function setSpacerHeight() {
-    const height = Math.max(1, Math.ceil(meta.fileSize / meta.bytesPerPixel));
+    const lineCount = getEffectiveLineCount();
+    const height = Math.max(1, Math.ceil(lineCount * lineHeight));
     spacer.style.height = `${height}px`;
   }
 
-  function updateRange(offset, length) {
+  function updateFileMeta() {
     if (!meta) {
       return;
     }
-    const end = Math.min(meta.fileSize, offset + length);
-    rangeMeta.textContent = `Bytes ${offset.toLocaleString()} - ${end.toLocaleString()}`;
+    fileMeta.textContent = `${formatBytes(meta.fileSize)} total • ${formatLineCount(
+      meta.lineCount
+    )}`;
   }
 
-  function renderChunk(text, offset) {
-    logContent.textContent = text || "";
-    if (meta) {
-      const top = Math.floor(offset / meta.bytesPerPixel);
-      logContent.style.top = `${top}px`;
-      logContent.style.transform = "translateY(0)";
+  function updateRange(startLine, linesInText) {
+    if (!meta) {
+      return;
     }
-    updateRange(offset, text.length);
+    const endLine = startLine + Math.max(0, linesInText - 1);
+    const startLabel = startLine + 1;
+    const endLabel = Math.max(startLabel, endLine + 1);
+    if (meta.lineCount != null) {
+      rangeMeta.textContent = `Lines ${startLabel.toLocaleString()} - ${endLabel.toLocaleString()} of ${meta.lineCount.toLocaleString()}`;
+    } else {
+      rangeMeta.textContent = `Lines ${startLabel.toLocaleString()} - ${endLabel.toLocaleString()}`;
+    }
   }
 
-  async function loadChunk(offset) {
+  function renderChunk(text, startLine) {
+    logContent.textContent = text || "";
+    logContent.style.top = `${startLine * lineHeight}px`;
+    logContent.style.transform = "translateY(0)";
+    const lines = countLinesInText(text);
+    currentRangeStart = startLine;
+    currentRangeEnd = startLine + lines;
+    updateRange(startLine, lines);
+  }
+
+  async function loadChunk(line) {
     if (!meta || pending) {
       return;
     }
-    pending = true;
 
-    const alignedOffset = Math.max(0, offset - (offset % meta.chunkSize));
-    if (alignedOffset === lastOffset) {
-      pending = false;
+    if (line >= currentRangeStart && line < currentRangeEnd) {
       return;
     }
-    lastOffset = alignedOffset;
+
+    pending = true;
+    const chunkLines = meta.chunkLines || 200;
+    const startLine = Math.max(0, line - Math.floor(chunkLines / 2));
 
     try {
-      const url = `/api/chunk?offset=${alignedOffset}&length=${meta.chunkSize}`;
+      const url = `/api/chunk?line=${startLine}&lines=${chunkLines}&charset=${encodeURIComponent(
+        currentCharset || ""
+      )}`;
       const response = await fetch(url, { cache: "no-store" });
       if (!response.ok) {
         throw new Error("Chunk fetch failed");
       }
       const text = await response.text();
-      renderChunk(text, alignedOffset);
+      renderChunk(text, startLine);
     } catch (err) {
-      renderChunk("(failed to load log chunk)", alignedOffset);
+      renderChunk("(failed to load log chunk)", startLine);
     } finally {
       pending = false;
     }
@@ -81,8 +149,61 @@
     if (!meta) {
       return;
     }
-    const offset = Math.floor(scrollArea.scrollTop * meta.bytesPerPixel);
-    loadChunk(offset);
+    const line = Math.floor(scrollArea.scrollTop / lineHeight);
+    loadChunk(line);
+  }
+
+  function applyWrapToggle() {
+    if (!wrapToggle) {
+      return;
+    }
+    wrapToggle.checked = document.body.classList.contains("wrap-on");
+    wrapToggle.addEventListener("change", () => {
+      document.body.classList.toggle("wrap-on", wrapToggle.checked);
+      document.body.classList.toggle("wrap-off", !wrapToggle.checked);
+    });
+  }
+
+  function populateCharsetOptions() {
+    if (!charsetSelect || !meta || !Array.isArray(meta.charsetOptions)) {
+      return;
+    }
+    charsetSelect.innerHTML = "";
+    meta.charsetOptions.forEach((option) => {
+      const entry = document.createElement("option");
+      entry.value = option;
+      entry.textContent = option;
+      charsetSelect.appendChild(entry);
+    });
+    charsetSelect.value = currentCharset || meta.charset;
+    charsetSelect.addEventListener("change", () => {
+      currentCharset = charsetSelect.value;
+      const currentLine = Math.floor(scrollArea.scrollTop / lineHeight);
+      loadChunk(currentLine);
+    });
+  }
+
+  async function refreshMeta() {
+    try {
+      const response = await fetch("/api/meta", { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error("Meta fetch failed");
+      }
+      const updated = await response.json();
+      meta = { ...meta, ...updated };
+      updateFileMeta();
+      setSpacerHeight();
+      if (meta.lineCountReady) {
+        if (metaPollTimer) {
+          clearTimeout(metaPollTimer);
+          metaPollTimer = null;
+        }
+      } else {
+        metaPollTimer = setTimeout(refreshMeta, 1000);
+      }
+    } catch (err) {
+      fileMeta.textContent = "Failed to load metadata";
+    }
   }
 
   async function init() {
@@ -92,16 +213,16 @@
         throw new Error("Meta fetch failed");
       }
       meta = await response.json();
-      fileMeta.textContent = `${formatBytes(meta.fileSize)} total`;
+      currentCharset = meta.charset;
+      lineHeight = getLineHeightPx();
+      updateFileMeta();
       setSpacerHeight();
       renderChunk("", 0);
       await loadChunk(0);
-      if (wrapToggle) {
-        wrapToggle.checked = document.body.classList.contains("wrap-on");
-        wrapToggle.addEventListener("change", () => {
-          document.body.classList.toggle("wrap-on", wrapToggle.checked);
-          document.body.classList.toggle("wrap-off", !wrapToggle.checked);
-        });
+      applyWrapToggle();
+      populateCharsetOptions();
+      if (!meta.lineCountReady) {
+        metaPollTimer = setTimeout(refreshMeta, 1000);
       }
       scrollArea.addEventListener("scroll", () => {
         window.requestAnimationFrame(onScroll);
