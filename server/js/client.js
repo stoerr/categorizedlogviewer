@@ -273,20 +273,6 @@
       const card = document.createElement("div");
       card.className = "category-card";
 
-      const nameRow = document.createElement("div");
-      nameRow.className = "category-row";
-      const nameInput = document.createElement("input");
-      nameInput.type = "text";
-      nameInput.className = "form-control form-control-sm";
-      nameInput.value = category.name;
-      nameInput.placeholder = "Name";
-      nameInput.oninput = () => {
-        categories[index].name = nameInput.value;
-        saveCategories();
-      };
-      nameRow.appendChild(nameInput);
-      card.appendChild(nameRow);
-
       const patternRow = document.createElement("div");
       patternRow.className = "category-row";
       const patternInput = document.createElement("input");
@@ -299,7 +285,14 @@
         compileCategories();
         saveCategories();
         renderChunk(rawChunkText, rawChunkStart);
-        renderCategoryList();
+        const matcher = categoryMatchers[index];
+        if (matcher && matcher.error) {
+          patternInput.classList.add("is-invalid");
+          patternInput.title = matcher.error;
+        } else {
+          patternInput.classList.remove("is-invalid");
+          patternInput.title = "";
+        }
       };
       const matcher = categoryMatchers[index];
       if (matcher && matcher.error) {
@@ -382,6 +375,7 @@
     const width = String(Math.max(1, totalLines)).length;
     const lineNumbersBuffer = [];
     const contentBuffer = [];
+    const visibleLineNumbers = [];
 
     lines.forEach((line, index) => {
       const lineNo = startLine + index + 1;
@@ -399,10 +393,6 @@
         matches.some((matcher) => matcher.category.id === soloCategory.id);
 
       if (!soloMatch) {
-        contentBuffer.push('<span class="log-line">&nbsp;</span>');
-        if (lineNumbersEnabled) {
-          lineNumbersBuffer.push("");
-        }
         return;
       }
 
@@ -420,9 +410,10 @@
       if (lineNumbersEnabled) {
         lineNumbersBuffer.push(String(lineNo).padStart(width, " "));
       }
+      visibleLineNumbers.push(lineNo);
     });
 
-    logContent.innerHTML = contentBuffer.join("\n");
+    logContent.innerHTML = contentBuffer.join("");
     logRow.style.top = `${startLine * lineHeight}px`;
     logRow.style.transform = "translateY(0)";
     if (lineNumbersEnabled) {
@@ -433,7 +424,19 @@
     const lineCount = countLinesInText(rawChunkText);
     currentRangeStart = startLine;
     currentRangeEnd = startLine + lineCount;
-    updateRange(startLine, lineCount);
+    if (soloCategory && visibleLineNumbers.length > 0) {
+      const first = visibleLineNumbers[0];
+      const last = visibleLineNumbers[visibleLineNumbers.length - 1];
+      if (meta && meta.lineCount != null) {
+        rangeMeta.textContent = `Lines ${first.toLocaleString()} - ${last.toLocaleString()} of ${meta.lineCount.toLocaleString()} (solo)`;
+      } else {
+        rangeMeta.textContent = `Lines ${first.toLocaleString()} - ${last.toLocaleString()} (solo)`;
+      }
+    } else if (soloCategory) {
+      rangeMeta.textContent = "No matching lines in view (solo)";
+    } else {
+      updateRange(startLine, lineCount);
+    }
   }
 
   function normalizeWindowStart(startLine) {
