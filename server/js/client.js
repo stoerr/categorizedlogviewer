@@ -13,6 +13,7 @@
 
   let meta = null;
   let pending = false;
+  let queuedLine = null;
   let lineHeight = 16;
   let currentRangeStart = 0;
   let currentRangeEnd = 0;
@@ -116,7 +117,12 @@
   }
 
   async function loadChunk(line) {
-    if (!meta || pending) {
+    if (!meta) {
+      return;
+    }
+
+    if (pending) {
+      queuedLine = line;
       return;
     }
 
@@ -142,6 +148,11 @@
       renderChunk("(failed to load log chunk)", startLine);
     } finally {
       pending = false;
+      if (queuedLine !== null) {
+        const nextLine = queuedLine;
+        queuedLine = null;
+        loadChunk(nextLine);
+      }
     }
   }
 
@@ -150,6 +161,16 @@
       return;
     }
     const line = Math.floor(scrollArea.scrollTop / lineHeight);
+    const chunkLines = meta.chunkLines || 200;
+    const preloadLines = Math.max(20, Math.floor(chunkLines / 4));
+    if (line >= currentRangeEnd - preloadLines) {
+      loadChunk(line + preloadLines);
+      return;
+    }
+    if (line <= currentRangeStart + preloadLines && line > 0) {
+      loadChunk(Math.max(0, line - preloadLines));
+      return;
+    }
     loadChunk(line);
   }
 
@@ -179,6 +200,8 @@
     charsetSelect.addEventListener("change", () => {
       currentCharset = charsetSelect.value;
       const currentLine = Math.floor(scrollArea.scrollTop / lineHeight);
+      currentRangeStart = 0;
+      currentRangeEnd = 0;
       loadChunk(currentLine);
     });
   }

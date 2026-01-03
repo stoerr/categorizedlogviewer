@@ -66,26 +66,17 @@ function fileExists(filePath) {
 }
 
 function pickPort(startPort, range) {
-  const candidates = [];
-  for (let i = 0; i < range; i += 1) {
-    candidates.push(startPort + i);
-  }
-  // Simple shuffle for randomness
-  for (let i = candidates.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
-  }
-
   return new Promise((resolve, reject) => {
     let index = 0;
 
     const tryNext = () => {
-      if (index >= candidates.length) {
+      if (index >= range) {
         reject(new Error("No free port found"));
         return;
       }
 
-      const port = candidates[index++];
+      const port = startPort + index;
+      index += 1;
       const server = net.createServer();
       server.unref();
       server.on("error", () => {
@@ -129,7 +120,7 @@ async function main() {
     process.exit(1);
   }
 
-  const port = await pickPort(3223, 200);
+  const port = await pickPort(3200, 200);
   const serverModule = require(serverPath);
   const server = await serverModule.start({
     port,

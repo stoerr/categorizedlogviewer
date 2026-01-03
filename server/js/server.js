@@ -205,6 +205,8 @@ function send(res, status, body, contentType) {
   res.writeHead(status, {
     "Content-Type": contentType || "text/plain; charset=utf-8",
     "Cache-Control": "no-store",
+    Pragma: "no-cache",
+    Expires: "0",
   });
   res.end(body);
 }
