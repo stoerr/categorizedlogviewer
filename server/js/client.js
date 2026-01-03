@@ -6,6 +6,7 @@
   const logContent = document.getElementById("log-content");
   const fileMeta = document.getElementById("file-meta");
   const rangeMeta = document.getElementById("range-meta");
+  const wrapToggle = document.getElementById("wrap-toggle");
 
   let meta = null;
   let lastOffset = null;
@@ -40,7 +41,11 @@
 
   function renderChunk(text, offset) {
     logContent.textContent = text || "";
-    logContent.style.transform = `translateY(${scrollArea.scrollTop}px)`;
+    if (meta) {
+      const top = Math.floor(offset / meta.bytesPerPixel);
+      logContent.style.top = `${top}px`;
+      logContent.style.transform = "translateY(0)";
+    }
     updateRange(offset, text.length);
   }
 
@@ -76,7 +81,6 @@
     if (!meta) {
       return;
     }
-    logContent.style.transform = `translateY(${scrollArea.scrollTop}px)`;
     const offset = Math.floor(scrollArea.scrollTop * meta.bytesPerPixel);
     loadChunk(offset);
   }
@@ -92,6 +96,13 @@
       setSpacerHeight();
       renderChunk("", 0);
       await loadChunk(0);
+      if (wrapToggle) {
+        wrapToggle.checked = document.body.classList.contains("wrap-on");
+        wrapToggle.addEventListener("change", () => {
+          document.body.classList.toggle("wrap-on", wrapToggle.checked);
+          document.body.classList.toggle("wrap-off", !wrapToggle.checked);
+        });
+      }
       scrollArea.addEventListener("scroll", () => {
         window.requestAnimationFrame(onScroll);
       });

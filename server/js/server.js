@@ -3,8 +3,6 @@
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
-const url = require("url");
-
 const CHUNK_SIZE = 64 * 1024; // 64KB default chunk
 const BYTES_PER_PIXEL = 256; // virtual scroll scale
 
@@ -33,7 +31,7 @@ function serveFile(res, filePath, contentType) {
   }
 }
 
-function start({ port, filePath, wrap }) {
+function start({ port, filePath, wrap, verbose }) {
   const serverRoot = path.resolve(__dirname, "..", "..");
   const htmlPath = path.join(serverRoot, "server", "html", "index.html");
   const clientPath = path.join(serverRoot, "server", "js", "client.js");
@@ -44,72 +42,106 @@ function start({ port, filePath, wrap }) {
   const fileName = path.basename(filePath);
 
   const server = http.createServer((req, res) => {
-    const parsed = url.parse(req.url, true);
+    if (verbose) {
+      process.stdout.write(`[request] ${req.method} ${req.url}\n`);
+    }
 
-    if (parsed.pathname === "/") {
-      const html = readTemplate(htmlPath, {
-        FILE_NAME: fileName,
-        FILE_SIZE: String(fileSize),
-        WRAP_CLASS: wrap ? "wrap-on" : "wrap-off",
-      });
-      send(res, 200, html, "text/html; charset=utf-8");
+    let parsed;
+    try {
+      parsed = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
+    } catch (err) {
+      if (verbose) {
+        process.stderr.write(`[error] ${err.stack || err.message}\n`);
+      }
+      send(res, 400, "Bad request");
       return;
     }
 
-    if (parsed.pathname === "/js/client.js") {
-      serveFile(res, clientPath, "application/javascript; charset=utf-8");
-      return;
-    }
-
-    if (parsed.pathname === "/css/style.css") {
-      serveFile(res, stylePath, "text/css; charset=utf-8");
-      return;
-    }
-
-    if (parsed.pathname === "/api/meta") {
-      const payload = JSON.stringify({
-        fileName,
-        fileSize,
-        chunkSize: CHUNK_SIZE,
-        bytesPerPixel: BYTES_PER_PIXEL,
-      });
-      send(res, 200, payload, "application/json; charset=utf-8");
-      return;
-    }
-
-    if (parsed.pathname === "/api/chunk") {
-      const offset = Number(parsed.query.offset || 0);
-      const length = Number(parsed.query.length || CHUNK_SIZE);
-
-      if (Number.isNaN(offset) || Number.isNaN(length)) {
-        send(res, 400, "Invalid offset or length");
+    try {
+      if (parsed.pathname === "/") {
+        const html = readTemplate(htmlPath, {
+          FILE_NAME: fileName,
+          FILE_SIZE: String(fileSize),
+          WRAP_CLASS: wrap ? "wrap-on" : "wrap-off",
+        });
+        send(res, 200, html, "text/html; charset=utf-8");
         return;
       }
 
-      const safeOffset = Math.max(0, Math.min(offset, fileSize));
-      const safeLength = Math.max(0, Math.min(length, fileSize - safeOffset));
+      if (parsed.pathname === "/js/client.js") {
+        serveFile(res, clientPath, "application/javascript; charset=utf-8");
+        return;
+      }
 
-      const stream = fs.createReadStream(filePath, {
-        start: safeOffset,
-        end: safeOffset + safeLength - 1,
-        encoding: "utf8",
-      });
+      if (parsed.pathname === "/css/style.css") {
+        serveFile(res, stylePath, "text/css; charset=utf-8");
+        return;
+      }
 
-      res.writeHead(200, {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Cache-Control": "no-store",
-      });
+      if (parsed.pathname === "/api/meta") {
+        const payload = JSON.stringify({
+          fileName,
+          fileSize,
+          chunkSize: CHUNK_SIZE,
+          bytesPerPixel: BYTES_PER_PIXEL,
+        });
+        send(res, 200, payload, "application/json; charset=utf-8");
+        return;
+      }
 
-      stream.on("error", () => {
-        res.end("");
-      });
+      if (parsed.pathname === "/api/chunk") {
+        const offset = Number(parsed.searchParams.get("offset") || 0);
+        const length = Number(parsed.searchParams.get("length") || CHUNK_SIZE);
 
-      stream.pipe(res);
-      return;
+        if (Number.isNaN(offset) || Number.isNaN(length)) {
+          send(res, 400, "Invalid offset or length");
+          return;
+        }
+
+        const safeOffset = Math.max(0, Math.min(offset, fileSize));
+        const safeLength = Math.max(0, Math.min(length, fileSize - safeOffset));
+
+        if (safeLength === 0) {
+          send(res, 200, "", "text/plain; charset=utf-8");
+          return;
+        }
+
+        const stream = fs.createReadStream(filePath, {
+          start: safeOffset,
+          end: safeOffset + safeLength - 1,
+          encoding: "utf8",
+        });
+
+        res.writeHead(200, {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-store",
+        });
+
+        stream.on("error", (err) => {
+          if (verbose) {
+            process.stderr.write(`[error] ${err.stack || err.message}\n`);
+          }
+          res.end("");
+        });
+
+        stream.pipe(res);
+        return;
+      }
+
+      send(res, 404, "Not found");
+    } catch (err) {
+      if (verbose) {
+        process.stderr.write(`[error] ${err.stack || err.message}\n`);
+      }
+      send(res, 500, "Server error");
     }
-
-    send(res, 404, "Not found");
   });
+
+  if (verbose) {
+    server.on("clientError", (err) => {
+      process.stderr.write(`[error] ${err.stack || err.message}\n`);
+    });
+  }
 
   return new Promise((resolve, reject) => {
     server.listen(port, "127.0.0.1", (err) => {

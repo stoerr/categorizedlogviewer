@@ -7,7 +7,7 @@ const net = require("net");
 const { spawn } = require("child_process");
 
 function printHelp() {
-  const helpText = `logviewer - view a logfile in a browser\n\nUsage:\n  logviewer [options] <logfile>\n\nOptions:\n  --wrap           Wrap long lines\n  --no-wrap        Do not wrap long lines (default)\n  -h, --help, -?   Show this help\n`;
+  const helpText = `logviewer - view a logfile in a browser\n\nUsage:\n  logviewer [options] <logfile>\n\nOptions:\n  --wrap           Wrap long lines\n  --no-wrap        Do not wrap long lines (default)\n  -v, --verbose    Log all web requests and exceptions\n  -h, --help, -?   Show this help\n`;
   process.stdout.write(helpText);
 }
 
@@ -22,6 +22,7 @@ function parseArgs(argv) {
   }
 
   let wrap = false;
+  let verbose = false;
   let filePath = null;
 
   for (const arg of args) {
@@ -29,6 +30,8 @@ function parseArgs(argv) {
       wrap = true;
     } else if (arg === "--no-wrap") {
       wrap = false;
+    } else if (arg === "-v" || arg === "--verbose") {
+      verbose = true;
     } else if (!filePath) {
       filePath = arg;
     } else {
@@ -40,7 +43,7 @@ function parseArgs(argv) {
     return { error: "Missing logfile path" };
   }
 
-  return { filePath, wrap };
+  return { filePath, wrap, verbose };
 }
 
 function fileExists(filePath) {
@@ -121,6 +124,7 @@ async function main() {
     port,
     filePath: absoluteFilePath,
     wrap: parsed.wrap,
+    verbose: parsed.verbose,
   });
 
   const url = `http://127.0.0.1:${port}/`;
