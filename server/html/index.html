@@ -38,12 +38,24 @@
           </div>
         </div>
       </header>
-      <main class="viewer">
-        <div id="scroll-area" class="scroll-area">
-          <div id="spacer" class="spacer"></div>
-          <div id="log-row" class="log-row">
-            <pre id="line-numbers" class="line-numbers"></pre>
-            <pre id="log-content" class="log-content"></pre>
+      <main class="viewer-layout">
+        <aside class="sidebar">
+          <div class="sidebar-header">
+            <div class="fw-semibold small">Categories</div>
+            <button id="add-category" class="btn btn-sm btn-outline-secondary">Add</button>
+          </div>
+          <div id="category-list" class="category-list"></div>
+          <div id="category-empty" class="category-empty text-muted small">
+            Add a category to mark or solo matching lines.
+          </div>
+        </aside>
+        <div class="viewer">
+          <div id="scroll-area" class="scroll-area">
+            <div id="spacer" class="spacer"></div>
+            <div id="log-row" class="log-row">
+              <pre id="line-numbers" class="line-numbers"></pre>
+              <pre id="log-content" class="log-content"></pre>
+            </div>
           </div>
         </div>
       </main>

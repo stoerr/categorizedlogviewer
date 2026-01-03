@@ -305,6 +305,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
         const payload = JSON.stringify({
           fileId: fileId,
           fileName: selected.fileName,
+          filePath: selected.filePath,
           fileSize: selected.fileSize,
           chunkLines: CHUNK_LINES,
           lineCount: selected.lineIndex.ready ? selected.lineIndex.lineCount : null,

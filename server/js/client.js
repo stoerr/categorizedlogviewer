@@ -12,8 +12,13 @@
   const charsetSelect = document.getElementById("charset-select");
   const fileSelect = document.getElementById("file-select");
   const lineNumbersToggle = document.getElementById("line-numbers-toggle");
+  const addCategoryButton = document.getElementById("add-category");
+  const categoryList = document.getElementById("category-list");
+  const categoryEmpty = document.getElementById("category-empty");
 
   const ESTIMATED_BYTES_PER_LINE = 80;
+  const CATEGORY_STORAGE_PREFIX =
+    "net.stoerr.Categorizedlogfileviewer.categories.com";
 
   let meta = null;
   let pending = false;
@@ -31,6 +36,9 @@
   let prefetched = null;
   let prefetchStart = null;
   let prefetchPromise = null;
+  let categories = [];
+  let categoryMatchers = [];
+  let categoriesKey = null;
 
   function formatBytes(bytes) {
     if (bytes < 1024) {
@@ -118,35 +126,314 @@
     }
   }
 
+  function escapeHtml(text) {
+    return text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function randomColor() {
+    const hue = Math.floor(Math.random() * 360);
+    const saturation = 65;
+    const lightness = 55;
+    const toRgb = (l, s, h) => {
+      const c = (1 - Math.abs(2 * l - 1)) * s;
+      const hp = h / 60;
+      const x = c * (1 - Math.abs((hp % 2) - 1));
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      if (hp >= 0 && hp < 1) {
+        r = c;
+        g = x;
+      } else if (hp >= 1 && hp < 2) {
+        r = x;
+        g = c;
+      } else if (hp >= 2 && hp < 3) {
+        g = c;
+        b = x;
+      } else if (hp >= 3 && hp < 4) {
+        g = x;
+        b = c;
+      } else if (hp >= 4 && hp < 5) {
+        r = x;
+        b = c;
+      } else if (hp >= 5 && hp < 6) {
+        r = c;
+        b = x;
+      }
+      const m = l - c / 2;
+      return {
+        r: Math.round((r + m) * 255),
+        g: Math.round((g + m) * 255),
+        b: Math.round((b + m) * 255),
+      };
+    };
+    const rgb = toRgb(lightness / 100, saturation / 100, hue);
+    const toHex = (value) => value.toString(16).padStart(2, "0");
+    return `#${toHex(rgb.r)}${toHex(rgb.g)}${toHex(rgb.b)}`;
+  }
+
+  function categoryStorageKey() {
+    const fileKey = meta && meta.filePath ? meta.filePath : meta?.fileName || "unknown";
+    return `${CATEGORY_STORAGE_PREFIX}:${fileKey}`;
+  }
+
+  function loadCategories() {
+    if (!meta) {
+      categories = [];
+      categoryMatchers = [];
+      return;
+    }
+    const key = categoryStorageKey();
+    categoriesKey = key;
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        categories = JSON.parse(raw);
+      } else {
+        categories = [];
+      }
+    } catch (err) {
+      categories = [];
+    }
+    categories = categories.map((category) => ({
+      id: category.id || String(Math.random()),
+      name: category.name || "Category",
+      pattern: category.pattern || "",
+      color: category.color || randomColor(),
+      mark: Boolean(category.mark),
+      solo: Boolean(category.solo),
+    }));
+    normalizeSolo();
+    compileCategories();
+    renderCategoryList();
+  }
+
+  function saveCategories() {
+    if (!meta) {
+      return;
+    }
+    const key = categoryStorageKey();
+    try {
+      localStorage.setItem(key, JSON.stringify(categories));
+    } catch (err) {
+      // Ignore storage failures.
+    }
+  }
+
+  function compileCategories() {
+    categoryMatchers = categories.map((category) => {
+      let regex = null;
+      let error = null;
+      if (category.pattern) {
+        try {
+          regex = new RegExp(category.pattern);
+        } catch (err) {
+          error = err.message;
+        }
+      }
+      return { category, regex, error };
+    });
+  }
+
+  function normalizeSolo() {
+    const solo = categories.find((category) => category.solo);
+    if (!solo) {
+      categories.forEach((category) => {
+        category.solo = false;
+      });
+    } else {
+      categories.forEach((category) => {
+        category.solo = category.id === solo.id;
+      });
+    }
+  }
+
+  function updateCategories(nextCategories) {
+    categories = nextCategories;
+    normalizeSolo();
+    compileCategories();
+    saveCategories();
+    renderCategoryList();
+    renderChunk(rawChunkText, rawChunkStart);
+  }
+
+  function renderCategoryList() {
+    if (!categoryList || !categoryEmpty) {
+      return;
+    }
+    categoryList.innerHTML = "";
+    categoryEmpty.style.display = categories.length === 0 ? "block" : "none";
+
+    categories.forEach((category, index) => {
+      const card = document.createElement("div");
+      card.className = "category-card";
+
+      const nameRow = document.createElement("div");
+      nameRow.className = "category-row";
+      const nameInput = document.createElement("input");
+      nameInput.type = "text";
+      nameInput.className = "form-control form-control-sm";
+      nameInput.value = category.name;
+      nameInput.placeholder = "Name";
+      nameInput.oninput = () => {
+        categories[index].name = nameInput.value;
+        saveCategories();
+      };
+      nameRow.appendChild(nameInput);
+      card.appendChild(nameRow);
+
+      const patternRow = document.createElement("div");
+      patternRow.className = "category-row";
+      const patternInput = document.createElement("input");
+      patternInput.type = "text";
+      patternInput.className = "form-control form-control-sm";
+      patternInput.value = category.pattern;
+      patternInput.placeholder = "Regex";
+      patternInput.oninput = () => {
+        categories[index].pattern = patternInput.value;
+        compileCategories();
+        saveCategories();
+        renderChunk(rawChunkText, rawChunkStart);
+        renderCategoryList();
+      };
+      const matcher = categoryMatchers[index];
+      if (matcher && matcher.error) {
+        patternInput.classList.add("is-invalid");
+        patternInput.title = matcher.error;
+      }
+      patternRow.appendChild(patternInput);
+      card.appendChild(patternRow);
+
+      const actionRow = document.createElement("div");
+      actionRow.className = "category-actions";
+
+      const colorInput = document.createElement("input");
+      colorInput.type = "color";
+      colorInput.className = "category-color";
+      colorInput.value = category.color;
+      colorInput.oninput = () => {
+        categories[index].color = colorInput.value;
+        saveCategories();
+        renderChunk(rawChunkText, rawChunkStart);
+      };
+      actionRow.appendChild(colorInput);
+
+      const markButton = document.createElement("button");
+      markButton.type = "button";
+      markButton.className = `category-action${category.mark ? " is-active" : ""}`;
+      markButton.title = "Mark";
+      markButton.innerHTML =
+        '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 7a3 3 0 0 1 3-3h9l4 4v9a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3V7zm5 3h6v2H9V10zm0 4h6v2H9v-2z"/></svg>';
+      markButton.onclick = () => {
+        categories[index].mark = !categories[index].mark;
+        updateCategories([...categories]);
+      };
+      actionRow.appendChild(markButton);
+
+      const soloButton = document.createElement("button");
+      soloButton.type = "button";
+      soloButton.className = `category-action${category.solo ? " is-active" : ""}`;
+      soloButton.title = "Solo";
+      soloButton.innerHTML =
+        '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><circle cx="12" cy="12" r="7" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="12" cy="12" r="2" fill="currentColor"/></svg>';
+      soloButton.onclick = () => {
+        categories.forEach((item) => {
+          item.solo = item.id === category.id ? !category.solo : false;
+        });
+        updateCategories([...categories]);
+      };
+      actionRow.appendChild(soloButton);
+
+      card.appendChild(actionRow);
+      categoryList.appendChild(card);
+    });
+  }
+
+  function addCategory() {
+    const next = [
+      ...categories,
+      {
+        id: String(Date.now() + Math.random()),
+        name: "Category",
+        pattern: "",
+        color: randomColor(),
+        mark: false,
+        solo: false,
+      },
+    ];
+    updateCategories(next);
+  }
+
   function renderChunk(text, startLine) {
     rawChunkText = text || "";
     rawChunkStart = startLine;
-    logContent.textContent = rawChunkText;
+    let lines = rawChunkText.split("\n");
+    if (rawChunkText.endsWith("\n")) {
+      lines = lines.slice(0, -1);
+    }
+    const soloCategory = categories.find((category) => category.solo);
+    const totalLines =
+      meta && meta.lineCount != null ? meta.lineCount : startLine + lines.length;
+    const width = String(Math.max(1, totalLines)).length;
+    const lineNumbersBuffer = [];
+    const contentBuffer = [];
+
+    lines.forEach((line, index) => {
+      const lineNo = startLine + index + 1;
+      const matches = categoryMatchers.filter((matcher) => {
+        if (!matcher.regex) {
+          return false;
+        }
+        if (matcher.regex.global) {
+          matcher.regex.lastIndex = 0;
+        }
+        return matcher.regex.test(line);
+      });
+      const soloMatch =
+        !soloCategory ||
+        matches.some((matcher) => matcher.category.id === soloCategory.id);
+
+      if (!soloMatch) {
+        contentBuffer.push('<span class="log-line">&nbsp;</span>');
+        if (lineNumbersEnabled) {
+          lineNumbersBuffer.push("");
+        }
+        return;
+      }
+
+      const marked = matches.find((matcher) => matcher.category.mark);
+      const classes = ["log-line"];
+      let style = "";
+      if (marked) {
+        classes.push("marked");
+        style = ` style="--mark-color: ${marked.category.color}"`;
+      }
+      const safeLine = line.length === 0 ? "&nbsp;" : escapeHtml(line);
+      contentBuffer.push(
+        `<span class="${classes.join(" ")}"${style}>${safeLine}</span>`
+      );
+      if (lineNumbersEnabled) {
+        lineNumbersBuffer.push(String(lineNo).padStart(width, " "));
+      }
+    });
+
+    logContent.innerHTML = contentBuffer.join("\n");
     logRow.style.top = `${startLine * lineHeight}px`;
     logRow.style.transform = "translateY(0)";
     if (lineNumbersEnabled) {
-      let lines = rawChunkText.split("\n");
-      if (rawChunkText.endsWith("\n")) {
-        lines = lines.slice(0, -1);
-      }
-      const totalLines =
-        meta && meta.lineCount != null
-          ? meta.lineCount
-          : startLine + lines.length;
-      const width = String(Math.max(1, totalLines)).length;
-      lineNumbers.textContent = lines
-        .map((_, index) => {
-          const lineNo = startLine + index + 1;
-          return String(lineNo).padStart(width, " ");
-        })
-        .join("\n");
+      lineNumbers.textContent = lineNumbersBuffer.join("\n");
     } else {
       lineNumbers.textContent = "";
     }
-    const lines = countLinesInText(rawChunkText);
+    const lineCount = countLinesInText(rawChunkText);
     currentRangeStart = startLine;
-    currentRangeEnd = startLine + lines;
-    updateRange(startLine, lines);
+    currentRangeEnd = startLine + lineCount;
+    updateRange(startLine, lineCount);
   }
 
   function normalizeWindowStart(startLine) {
@@ -351,6 +638,9 @@
       meta = { ...meta, ...updated };
       currentFileId = meta.fileId;
       currentCharset = currentCharset || meta.charset;
+      if (categoryStorageKey() !== categoriesKey) {
+        loadCategories();
+      }
       updateFileMeta();
       setSpacerHeight();
       populateFileOptions();
@@ -380,12 +670,16 @@
       lineHeight = getLineHeightPx();
       updateFileMeta();
       setSpacerHeight();
+      loadCategories();
       renderChunk("", 0);
       await loadChunk(0, { force: true });
       applyWrapToggle();
       applyLineNumbersToggle();
       populateCharsetOptions();
       populateFileOptions();
+      if (addCategoryButton) {
+        addCategoryButton.onclick = addCategory;
+      }
       if (!meta.lineCountReady) {
         metaPollTimer = setTimeout(refreshMeta, 1000);
       }
