@@ -25,6 +25,11 @@ body {
   border-color: rgba(0, 0, 0, 0.08) !important;
 }
 
+.file-select {
+  min-width: 220px;
+  max-width: 360px;
+}
+
 .charset-select {
   min-width: 160px;
 }

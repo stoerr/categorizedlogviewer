@@ -220,17 +220,37 @@ function serveFile(res, filePath, contentType) {
   }
 }
 
-function start({ port, filePath, wrap, verbose, charset }) {
+function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
   const serverRoot = path.resolve(__dirname, "..", "..");
   const htmlPath = path.join(serverRoot, "server", "html", "index.html");
   const clientPath = path.join(serverRoot, "server", "js", "client.js");
   const stylePath = path.join(serverRoot, "server", "css", "style.css");
 
-  const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
-  const fileName = path.basename(filePath);
+  const files = filePaths.map((filePath, index) => ({
+    id: String(index),
+    path: filePath,
+    name: path.basename(filePath),
+  }));
+  const fileState = new Map();
+  const defaultFileId = files.length > 0 ? files[0].id : null;
 
-  const lineIndex = buildLineIndex(filePath, verbose);
+  function getFileInfo(fileId) {
+    const selected = files.find((entry) => entry.id === fileId);
+    if (!selected) {
+      return null;
+    }
+    if (!fileState.has(selected.id)) {
+      const stat = fs.statSync(selected.path);
+      fileState.set(selected.id, {
+        filePath: selected.path,
+        fileName: selected.name,
+        fileSize: stat.size,
+        lineIndex: buildLineIndex(selected.path, verbose),
+      });
+    }
+    return fileState.get(selected.id);
+  }
+
   const defaultCharset = normalizeCharset(charset);
 
   const server = http.createServer(async (req, res) => {
@@ -251,9 +271,14 @@ function start({ port, filePath, wrap, verbose, charset }) {
 
     try {
       if (parsed.pathname === "/") {
+        const selected = getFileInfo(defaultFileId);
+        if (!selected) {
+          send(res, 500, "No files configured");
+          return;
+        }
         const html = readTemplate(htmlPath, {
-          FILE_NAME: fileName,
-          FILE_SIZE: String(fileSize),
+          FILE_NAME: selected.fileName,
+          FILE_SIZE: String(selected.fileSize),
           WRAP_CLASS: wrap ? "wrap-on" : "wrap-off",
         });
         send(res, 200, html, "text/html; charset=utf-8");
@@ -271,21 +296,37 @@ function start({ port, filePath, wrap, verbose, charset }) {
       }
 
       if (parsed.pathname === "/api/meta") {
+        const fileId = parsed.searchParams.get("file") || defaultFileId;
+        const selected = getFileInfo(fileId);
+        if (!selected) {
+          send(res, 400, "Unknown file");
+          return;
+        }
         const payload = JSON.stringify({
-          fileName,
-          fileSize,
+          fileId: fileId,
+          fileName: selected.fileName,
+          fileSize: selected.fileSize,
           chunkLines: CHUNK_LINES,
-          lineCount: lineIndex.ready ? lineIndex.lineCount : null,
-          lineCountReady: lineIndex.ready,
+          lineCount: selected.lineIndex.ready ? selected.lineIndex.lineCount : null,
+          lineCountReady: selected.lineIndex.ready,
           lineIndexStride: INDEX_STRIDE,
           charset: defaultCharset,
           charsetOptions: CHARSET_OPTIONS,
+          wrap,
+          lineNumbers,
+          files: files.map((entry) => ({ id: entry.id, name: entry.name })),
         });
         send(res, 200, payload, "application/json; charset=utf-8");
         return;
       }
 
       if (parsed.pathname === "/api/chunk") {
+        const fileId = parsed.searchParams.get("file") || defaultFileId;
+        const selected = getFileInfo(fileId);
+        if (!selected) {
+          send(res, 400, "Unknown file");
+          return;
+        }
         const line = Number(parsed.searchParams.get("line") || 0);
         const lines = Number(parsed.searchParams.get("lines") || CHUNK_LINES);
         const charsetParam = normalizeCharset(
@@ -302,8 +343,8 @@ function start({ port, filePath, wrap, verbose, charset }) {
 
         try {
           const chunk = await readLineChunk({
-            filePath,
-            lineIndex,
+            filePath: selected.filePath,
+            lineIndex: selected.lineIndex,
             startLine: safeLine,
             lineCount: safeLines,
             charset: charsetParam,

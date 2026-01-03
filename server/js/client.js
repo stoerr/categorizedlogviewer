@@ -8,6 +8,8 @@
   const rangeMeta = document.getElementById("range-meta");
   const wrapToggle = document.getElementById("wrap-toggle");
   const charsetSelect = document.getElementById("charset-select");
+  const fileSelect = document.getElementById("file-select");
+  const lineNumbersToggle = document.getElementById("line-numbers-toggle");
 
   const ESTIMATED_BYTES_PER_LINE = 80;
 
@@ -18,6 +20,10 @@
   let currentRangeStart = 0;
   let currentRangeEnd = 0;
   let currentCharset = null;
+  let currentFileId = null;
+  let lineNumbersEnabled = false;
+  let rawChunkText = "";
+  let rawChunkStart = 0;
   let metaPollTimer = null;
 
   function formatBytes(bytes) {
@@ -106,11 +112,30 @@
     }
   }
 
+  function formatWithLineNumbers(text, startLine) {
+    if (!lineNumbersEnabled) {
+      return text;
+    }
+    const lines = text.split("\n");
+    const totalLines =
+      meta && meta.lineCount != null ? meta.lineCount : startLine + lines.length;
+    const width = String(Math.max(1, totalLines)).length;
+    return lines
+      .map((line, index) => {
+        const lineNo = startLine + index + 1;
+        const label = String(lineNo).padStart(width, " ");
+        return `${label} | ${line}`;
+      })
+      .join("\n");
+  }
+
   function renderChunk(text, startLine) {
-    logContent.textContent = text || "";
+    rawChunkText = text || "";
+    rawChunkStart = startLine;
+    logContent.textContent = formatWithLineNumbers(rawChunkText, rawChunkStart);
     logContent.style.top = `${startLine * lineHeight}px`;
     logContent.style.transform = "translateY(0)";
-    const lines = countLinesInText(text);
+    const lines = countLinesInText(rawChunkText);
     currentRangeStart = startLine;
     currentRangeEnd = startLine + lines;
     updateRange(startLine, lines);
@@ -135,7 +160,9 @@
     const startLine = Math.max(0, line - Math.floor(chunkLines / 2));
 
     try {
-      const url = `/api/chunk?line=${startLine}&lines=${chunkLines}&charset=${encodeURIComponent(
+      const url = `/api/chunk?file=${encodeURIComponent(
+        currentFileId || ""
+      )}&line=${startLine}&lines=${chunkLines}&charset=${encodeURIComponent(
         currentCharset || ""
       )}`;
       const response = await fetch(url, { cache: "no-store" });
@@ -185,6 +212,18 @@
     });
   }
 
+  function applyLineNumbersToggle() {
+    if (!lineNumbersToggle) {
+      return;
+    }
+    lineNumbersEnabled = Boolean(meta && meta.lineNumbers);
+    lineNumbersToggle.checked = lineNumbersEnabled;
+    lineNumbersToggle.addEventListener("change", () => {
+      lineNumbersEnabled = lineNumbersToggle.checked;
+      logContent.textContent = formatWithLineNumbers(rawChunkText, rawChunkStart);
+    });
+  }
+
   function populateCharsetOptions() {
     if (!charsetSelect || !meta || !Array.isArray(meta.charsetOptions)) {
       return;
@@ -197,25 +236,57 @@
       charsetSelect.appendChild(entry);
     });
     charsetSelect.value = currentCharset || meta.charset;
-    charsetSelect.addEventListener("change", () => {
+    charsetSelect.onchange = () => {
       currentCharset = charsetSelect.value;
       const currentLine = Math.floor(scrollArea.scrollTop / lineHeight);
       currentRangeStart = 0;
       currentRangeEnd = 0;
+      rawChunkText = "";
       loadChunk(currentLine);
+    };
+  }
+
+  function populateFileOptions() {
+    if (!fileSelect || !meta || !Array.isArray(meta.files)) {
+      return;
+    }
+    fileSelect.innerHTML = "";
+    meta.files.forEach((entry) => {
+      const option = document.createElement("option");
+      option.value = entry.id;
+      option.textContent = entry.name;
+      fileSelect.appendChild(option);
     });
+    fileSelect.disabled = meta.files.length <= 1;
+    fileSelect.value = currentFileId || meta.fileId;
+    fileSelect.onchange = async () => {
+      currentFileId = fileSelect.value;
+      currentRangeStart = 0;
+      currentRangeEnd = 0;
+      rawChunkText = "";
+      queuedLine = null;
+      pending = false;
+      scrollArea.scrollTop = 0;
+      await refreshMeta();
+      await loadChunk(0);
+    };
   }
 
   async function refreshMeta() {
     try {
-      const response = await fetch("/api/meta", { cache: "no-store" });
+      const response = await fetch(`/api/meta?file=${encodeURIComponent(
+        currentFileId || ""
+      )}`, { cache: "no-store" });
       if (!response.ok) {
         throw new Error("Meta fetch failed");
       }
       const updated = await response.json();
       meta = { ...meta, ...updated };
+      currentFileId = meta.fileId;
+      currentCharset = currentCharset || meta.charset;
       updateFileMeta();
       setSpacerHeight();
+      populateFileOptions();
       if (meta.lineCountReady) {
         if (metaPollTimer) {
           clearTimeout(metaPollTimer);
@@ -237,13 +308,17 @@
       }
       meta = await response.json();
       currentCharset = meta.charset;
+      currentFileId = meta.fileId;
+      lineNumbersEnabled = Boolean(meta.lineNumbers);
       lineHeight = getLineHeightPx();
       updateFileMeta();
       setSpacerHeight();
       renderChunk("", 0);
       await loadChunk(0);
       applyWrapToggle();
+      applyLineNumbersToggle();
       populateCharsetOptions();
+      populateFileOptions();
       if (!meta.lineCountReady) {
         metaPollTimer = setTimeout(refreshMeta, 1000);
       }

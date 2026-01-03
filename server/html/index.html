@@ -16,7 +16,7 @@
     <div class="app">
       <header class="header-bar px-2 py-1 border-bottom">
         <div class="d-flex flex-wrap align-items-center gap-3">
-          <div class="fw-semibold text-truncate">{{FILE_NAME}}</div>
+          <select id="file-select" class="form-select form-select-sm file-select"></select>
           <div class="text-muted small" id="file-meta">Loading metadata...</div>
           <div class="ms-auto d-flex align-items-center gap-3">
             <div class="d-flex align-items-center gap-2">
@@ -25,6 +25,10 @@
                 id="charset-select"
                 class="form-select form-select-sm charset-select"
               ></select>
+            </div>
+            <div class="form-check form-switch m-0">
+              <input class="form-check-input" type="checkbox" id="line-numbers-toggle" />
+              <label class="form-check-label small text-muted" for="line-numbers-toggle">Lines</label>
             </div>
             <div class="form-check form-switch m-0">
               <input class="form-check-input" type="checkbox" id="wrap-toggle" />
