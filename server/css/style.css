@@ -112,6 +112,15 @@ body {
   border-color: rgba(0, 0, 0, 0.4);
 }
 
+.category-card.drag-over {
+  border-color: rgba(0, 0, 0, 0.35);
+  background: rgba(180, 83, 9, 0.08);
+}
+
+.drag-handle {
+  cursor: grab;
+}
+
 .category-color {
   width: 28px;
   height: 28px;
@@ -156,6 +165,8 @@ body {
   user-select: none;
   text-align: right;
   min-width: 6ch;
+  font-size: 0.95rem;
+  font-family: inherit;
 }
 
 .log-content {
@@ -163,10 +174,13 @@ body {
   padding: 0;
   line-height: 1.4;
   white-space: pre;
+  font-size: 0.95rem;
+  font-family: inherit;
 }
 
 .log-line {
   display: block;
+  line-height: 1.4;
 }
 
 .log-line.marked {

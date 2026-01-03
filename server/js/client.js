@@ -39,6 +39,7 @@
   let categories = [];
   let categoryMatchers = [];
   let categoriesKey = null;
+  let soloRestoreScrollTop = null;
 
   function formatBytes(bytes) {
     if (bytes < 1024) {
@@ -202,10 +203,10 @@
     }
     categories = categories.map((category) => ({
       id: category.id || String(Math.random()),
-      name: category.name || "Category",
+      name: category.name || "",
       pattern: category.pattern || "",
       color: category.color || randomColor(),
-      mark: Boolean(category.mark),
+      hidden: Boolean(category.hidden),
       solo: Boolean(category.solo),
     }));
     normalizeSolo();
@@ -272,6 +273,7 @@
     categories.forEach((category, index) => {
       const card = document.createElement("div");
       card.className = "category-card";
+      card.dataset.index = String(index);
 
       const patternRow = document.createElement("div");
       patternRow.className = "category-row";
@@ -305,6 +307,19 @@
       const actionRow = document.createElement("div");
       actionRow.className = "category-actions";
 
+      const dragHandle = document.createElement("button");
+      dragHandle.type = "button";
+      dragHandle.className = "category-action drag-handle";
+      dragHandle.title = "Reorder";
+      dragHandle.draggable = true;
+      dragHandle.innerHTML =
+        '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M9 7h2v2H9V7zm4 0h2v2h-2V7zM9 11h2v2H9v-2zm4 0h2v2h-2v-2zM9 15h2v2H9v-2zm4 0h2v2h-2v-2z"/></svg>';
+      dragHandle.ondragstart = (event) => {
+        event.dataTransfer.setData("text/plain", String(index));
+        event.dataTransfer.effectAllowed = "move";
+      };
+      actionRow.appendChild(dragHandle);
+
       const colorInput = document.createElement("input");
       colorInput.type = "color";
       colorInput.className = "category-color";
@@ -316,17 +331,29 @@
       };
       actionRow.appendChild(colorInput);
 
-      const markButton = document.createElement("button");
-      markButton.type = "button";
-      markButton.className = `category-action${category.mark ? " is-active" : ""}`;
-      markButton.title = "Mark";
-      markButton.innerHTML =
-        '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 7a3 3 0 0 1 3-3h9l4 4v9a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3V7zm5 3h6v2H9V10zm0 4h6v2H9v-2z"/></svg>';
-      markButton.onclick = () => {
-        categories[index].mark = !categories[index].mark;
+      const hideButton = document.createElement("button");
+      hideButton.type = "button";
+      hideButton.className = `category-action${category.hidden ? " is-active" : ""}`;
+      hideButton.title = "Hide";
+      hideButton.innerHTML =
+        '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M2 12c2.5-4 6-6 10-6s7.5 2 10 6c-1 1.6-2.2 2.9-3.6 3.9l2 2-1.4 1.4-18-18L2 3.4l3 3C3.8 7.1 2.8 9.4 2 12zm6.1-2.9 2.1 2.1a2 2 0 0 0 2.6 2.6l2.1 2.1A6 6 0 0 1 8.1 9.1z"/></svg>';
+      hideButton.onclick = () => {
+        categories[index].hidden = !categories[index].hidden;
         updateCategories([...categories]);
       };
-      actionRow.appendChild(markButton);
+      actionRow.appendChild(hideButton);
+
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "category-action";
+      deleteButton.title = "Delete";
+      deleteButton.innerHTML =
+        '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9zM7 9h2v9H7V9z"/></svg>';
+      deleteButton.onclick = () => {
+        const next = categories.filter((_, i) => i !== index);
+        updateCategories(next);
+      };
+      actionRow.appendChild(deleteButton);
 
       const soloButton = document.createElement("button");
       soloButton.type = "button";
@@ -334,15 +361,46 @@
       soloButton.title = "Solo";
       soloButton.innerHTML =
         '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><circle cx="12" cy="12" r="7" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="12" cy="12" r="2" fill="currentColor"/></svg>';
-      soloButton.onclick = () => {
+      soloButton.onclick = async () => {
+        const wasSolo = Boolean(category.solo);
         categories.forEach((item) => {
           item.solo = item.id === category.id ? !category.solo : false;
         });
+        if (!wasSolo && soloRestoreScrollTop == null) {
+          soloRestoreScrollTop = scrollArea.scrollTop;
+        }
         updateCategories([...categories]);
+        if (!wasSolo) {
+          await scrollToFirstMatch(category);
+        } else if (soloRestoreScrollTop != null) {
+          scrollArea.scrollTop = soloRestoreScrollTop;
+          soloRestoreScrollTop = null;
+          const restoreLine = Math.floor(scrollArea.scrollTop / lineHeight);
+          await loadChunk(restoreLine, { force: true });
+        }
       };
       actionRow.appendChild(soloButton);
 
       card.appendChild(actionRow);
+      card.ondragover = (event) => {
+        event.preventDefault();
+        card.classList.add("drag-over");
+      };
+      card.ondragleave = () => {
+        card.classList.remove("drag-over");
+      };
+      card.ondrop = (event) => {
+        event.preventDefault();
+        card.classList.remove("drag-over");
+        const sourceIndex = Number(event.dataTransfer.getData("text/plain"));
+        if (Number.isNaN(sourceIndex) || sourceIndex === index) {
+          return;
+        }
+        const reordered = [...categories];
+        const [moved] = reordered.splice(sourceIndex, 1);
+        reordered.splice(index, 0, moved);
+        updateCategories(reordered);
+      };
       categoryList.appendChild(card);
     });
   }
@@ -352,14 +410,64 @@
       ...categories,
       {
         id: String(Date.now() + Math.random()),
-        name: "Category",
+        name: "",
         pattern: "",
         color: randomColor(),
-        mark: false,
+        hidden: false,
         solo: false,
       },
     ];
     updateCategories(next);
+  }
+
+  async function scrollToFirstMatch(category) {
+    if (!meta) {
+      return;
+    }
+    const matcher = categoryMatchers.find(
+      (entry) => entry.category.id === category.id
+    );
+    if (!matcher || !matcher.regex) {
+      scrollArea.scrollTop = 0;
+      await loadChunk(0, { force: true });
+      return;
+    }
+    const chunkLines = meta.chunkLines || 200;
+    const maxLines = meta.lineCount != null ? meta.lineCount : null;
+    let startLine = 0;
+    while (maxLines == null || startLine < maxLines) {
+      // eslint-disable-next-line no-await-in-loop
+      const text = await fetchChunk(startLine);
+      const lines = text.split("\n");
+      if (lines.length === 0 || (lines.length === 1 && lines[0] === "")) {
+        break;
+      }
+      if (text.endsWith("\n")) {
+        lines.pop();
+      }
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
+        if (matcher.regex.global) {
+          matcher.regex.lastIndex = 0;
+        }
+        if (matcher.regex.test(line)) {
+          const targetLine = startLine + index;
+          const targetTop = targetLine * lineHeight;
+          scrollArea.scrollTop = targetTop;
+          await loadChunk(targetLine, { force: true });
+          await new Promise((resolve) => {
+            window.requestAnimationFrame(() => resolve());
+          });
+          scrollArea.scrollTop = targetTop;
+          return;
+        }
+      }
+      if (lines.length < chunkLines) {
+        break;
+      }
+      startLine += chunkLines;
+    }
+    scrollArea.scrollTop = 0;
   }
 
   function renderChunk(text, startLine) {
@@ -388,6 +496,10 @@
         }
         return matcher.regex.test(line);
       });
+      const hiddenMatch = matches.find((matcher) => matcher.category.hidden);
+      if (hiddenMatch) {
+        return;
+      }
       const soloMatch =
         !soloCategory ||
         matches.some((matcher) => matcher.category.id === soloCategory.id);
@@ -396,7 +508,9 @@
         return;
       }
 
-      const marked = matches.find((matcher) => matcher.category.mark);
+      const marked = soloCategory
+        ? matches.find((matcher) => matcher.category.id === soloCategory.id)
+        : matches[0];
       const classes = ["log-line"];
       let style = "";
       if (marked) {
