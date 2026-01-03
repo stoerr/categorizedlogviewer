@@ -3,6 +3,8 @@
 
   const scrollArea = document.getElementById("scroll-area");
   const spacer = document.getElementById("spacer");
+  const logRow = document.getElementById("log-row");
+  const lineNumbers = document.getElementById("line-numbers");
   const logContent = document.getElementById("log-content");
   const fileMeta = document.getElementById("file-meta");
   const rangeMeta = document.getElementById("range-meta");
@@ -15,16 +17,21 @@
 
   let meta = null;
   let pending = false;
-  let queuedLine = null;
+  let queuedStart = null;
+  let pendingStart = null;
   let lineHeight = 16;
   let currentRangeStart = 0;
   let currentRangeEnd = 0;
+  let pendingStart = null;
   let currentCharset = null;
   let currentFileId = null;
   let lineNumbersEnabled = false;
   let rawChunkText = "";
   let rawChunkStart = 0;
   let metaPollTimer = null;
+  let prefetched = null;
+  let prefetchStart = null;
+  let prefetchPromise = null;
 
   function formatBytes(bytes) {
     if (bytes < 1024) {
@@ -112,73 +119,127 @@
     }
   }
 
-  function formatWithLineNumbers(text, startLine) {
-    if (!lineNumbersEnabled) {
-      return text;
-    }
-    const lines = text.split("\n");
-    const totalLines =
-      meta && meta.lineCount != null ? meta.lineCount : startLine + lines.length;
-    const width = String(Math.max(1, totalLines)).length;
-    return lines
-      .map((line, index) => {
-        const lineNo = startLine + index + 1;
-        const label = String(lineNo).padStart(width, " ");
-        return `${label} | ${line}`;
-      })
-      .join("\n");
-  }
-
   function renderChunk(text, startLine) {
     rawChunkText = text || "";
     rawChunkStart = startLine;
-    logContent.textContent = formatWithLineNumbers(rawChunkText, rawChunkStart);
-    logContent.style.top = `${startLine * lineHeight}px`;
-    logContent.style.transform = "translateY(0)";
+    logContent.textContent = rawChunkText;
+    logRow.style.top = `${startLine * lineHeight}px`;
+    logRow.style.transform = "translateY(0)";
+    if (lineNumbersEnabled) {
+      let lines = rawChunkText.split("\n");
+      if (rawChunkText.endsWith("\n")) {
+        lines = lines.slice(0, -1);
+      }
+      const totalLines =
+        meta && meta.lineCount != null
+          ? meta.lineCount
+          : startLine + lines.length;
+      const width = String(Math.max(1, totalLines)).length;
+      lineNumbers.textContent = lines
+        .map((_, index) => {
+          const lineNo = startLine + index + 1;
+          return String(lineNo).padStart(width, " ");
+        })
+        .join("\n");
+    } else {
+      lineNumbers.textContent = "";
+    }
     const lines = countLinesInText(rawChunkText);
     currentRangeStart = startLine;
     currentRangeEnd = startLine + lines;
     updateRange(startLine, lines);
   }
 
-  async function loadChunk(line) {
+  function normalizeWindowStart(startLine) {
+    if (!meta) {
+      return 0;
+    }
+    const chunkLines = meta.chunkLines || 200;
+    return Math.max(0, Math.floor(startLine / chunkLines) * chunkLines);
+  }
+
+  async function fetchChunk(startLine) {
+    const chunkLines = meta.chunkLines || 200;
+    const url = `/api/chunk?file=${encodeURIComponent(
+      currentFileId || ""
+    )}&line=${startLine}&lines=${chunkLines}&charset=${encodeURIComponent(
+      currentCharset || ""
+    )}`;
+    const response = await fetch(url, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error("Chunk fetch failed");
+    }
+    return response.text();
+  }
+
+  function startPrefetch(startLine) {
     if (!meta) {
       return;
     }
+    const normalizedStart = normalizeWindowStart(startLine);
+    if (prefetched && prefetched.start === normalizedStart) {
+      return;
+    }
+    if (prefetchPromise && prefetchStart === normalizedStart) {
+      return;
+    }
+    prefetchStart = normalizedStart;
+    prefetchPromise = fetchChunk(normalizedStart)
+      .then((text) => {
+        prefetched = { start: normalizedStart, text };
+        return prefetched;
+      })
+      .catch(() => null)
+      .finally(() => {
+        prefetchPromise = null;
+        prefetchStart = null;
+      });
+  }
+
+  async function loadChunk(startLine, options) {
+    if (!meta) {
+      return;
+    }
+    const force = options && options.force;
 
     if (pending) {
-      queuedLine = line;
+      queuedStart = startLine;
       return;
     }
 
-    if (line >= currentRangeStart && line < currentRangeEnd) {
+    const normalizedStart = normalizeWindowStart(startLine);
+    if (!force && (normalizedStart === currentRangeStart || normalizedStart === pendingStart)) {
       return;
     }
 
     pending = true;
-    const chunkLines = meta.chunkLines || 200;
-    const startLine = Math.max(0, line - Math.floor(chunkLines / 2));
+    pendingStart = normalizedStart;
 
     try {
-      const url = `/api/chunk?file=${encodeURIComponent(
-        currentFileId || ""
-      )}&line=${startLine}&lines=${chunkLines}&charset=${encodeURIComponent(
-        currentCharset || ""
-      )}`;
-      const response = await fetch(url, { cache: "no-store" });
-      if (!response.ok) {
-        throw new Error("Chunk fetch failed");
+      if (!force && prefetched && prefetched.start === normalizedStart) {
+        renderChunk(prefetched.text, normalizedStart);
+        prefetched = null;
+        return;
       }
-      const text = await response.text();
-      renderChunk(text, startLine);
+      if (!force && prefetchPromise && prefetchStart === normalizedStart) {
+        const chunk = await prefetchPromise;
+        if (chunk && chunk.start === normalizedStart) {
+          renderChunk(chunk.text, normalizedStart);
+          prefetched = null;
+          return;
+        }
+      }
+      const text = await fetchChunk(normalizedStart);
+      renderChunk(text, normalizedStart);
     } catch (err) {
-      renderChunk("(failed to load log chunk)", startLine);
+      renderChunk("(failed to load log chunk)", normalizedStart);
     } finally {
       pending = false;
-      if (queuedLine !== null) {
-        const nextLine = queuedLine;
-        queuedLine = null;
-        loadChunk(nextLine);
+      pendingStart = null;
+      if (queuedStart !== null) {
+        const nextStart = queuedStart;
+        queuedStart = null;
+        loadChunk(nextStart);
       }
     }
   }
@@ -191,14 +252,14 @@
     const chunkLines = meta.chunkLines || 200;
     const preloadLines = Math.max(20, Math.floor(chunkLines / 4));
     if (line >= currentRangeEnd - preloadLines) {
-      loadChunk(line + preloadLines);
-      return;
+      startPrefetch(currentRangeStart + chunkLines);
     }
     if (line <= currentRangeStart + preloadLines && line > 0) {
-      loadChunk(Math.max(0, line - preloadLines));
-      return;
+      startPrefetch(Math.max(0, currentRangeStart - chunkLines));
     }
-    loadChunk(line);
+    if (line < currentRangeStart || line >= currentRangeEnd) {
+      loadChunk(line);
+    }
   }
 
   function applyWrapToggle() {
@@ -218,9 +279,11 @@
     }
     lineNumbersEnabled = Boolean(meta && meta.lineNumbers);
     lineNumbersToggle.checked = lineNumbersEnabled;
+    document.body.classList.toggle("line-numbers-off", !lineNumbersEnabled);
     lineNumbersToggle.addEventListener("change", () => {
       lineNumbersEnabled = lineNumbersToggle.checked;
-      logContent.textContent = formatWithLineNumbers(rawChunkText, rawChunkStart);
+      document.body.classList.toggle("line-numbers-off", !lineNumbersEnabled);
+      renderChunk(rawChunkText, rawChunkStart);
     });
   }
 
@@ -242,7 +305,10 @@
       currentRangeStart = 0;
       currentRangeEnd = 0;
       rawChunkText = "";
-      loadChunk(currentLine);
+      prefetched = null;
+      prefetchPromise = null;
+      pendingStart = null;
+      loadChunk(currentLine, { force: true });
     };
   }
 
@@ -264,11 +330,13 @@
       currentRangeStart = 0;
       currentRangeEnd = 0;
       rawChunkText = "";
-      queuedLine = null;
+      queuedStart = null;
+      prefetched = null;
+      prefetchPromise = null;
       pending = false;
       scrollArea.scrollTop = 0;
       await refreshMeta();
-      await loadChunk(0);
+      await loadChunk(0, { force: true });
     };
   }
 
@@ -314,7 +382,7 @@
       updateFileMeta();
       setSpacerHeight();
       renderChunk("", 0);
-      await loadChunk(0);
+      await loadChunk(0, { force: true });
       applyWrapToggle();
       applyLineNumbersToggle();
       populateCharsetOptions();

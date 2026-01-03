@@ -49,15 +49,32 @@ body {
   width: 1px;
 }
 
-.log-content {
+.log-row {
   position: absolute;
   top: 0;
   left: 0;
-  margin: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   padding: 8px 12px;
-  line-height: 1.4;
   background: rgba(255, 255, 255, 0.85);
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.05);
+}
+
+.line-numbers {
+  margin: 0;
+  padding: 0 8px 0 0;
+  line-height: 1.4;
+  color: rgba(0, 0, 0, 0.5);
+  border-right: 1px solid rgba(0, 0, 0, 0.15);
+  user-select: none;
+  text-align: right;
+}
+
+.log-content {
+  margin: 0;
+  padding: 0;
+  line-height: 1.4;
 }
 
 .wrap-off .log-content {
@@ -71,4 +88,8 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   width: 100%;
+}
+
+.line-numbers-off .line-numbers {
+  display: none;
 }
