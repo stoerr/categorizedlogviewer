@@ -14,6 +14,7 @@ const CHARSET_OPTIONS = [
   "iso-8859-15",
   "windows-1252",
 ];
+const MATCH_COUNT_CACHE = new Map();
 
 function normalizeCharset(value) {
   if (!value) {
@@ -84,6 +85,147 @@ function getDecoder(charset) {
   } catch (err) {
     return new TextDecoder(DEFAULT_CHARSET);
   }
+}
+
+function scanFileLines(filePath, charset, onLine) {
+  const decoder = getDecoder(charset);
+  return new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath);
+    let buffer = "";
+    let lineNo = 0;
+    let stopped = false;
+    let finished = false;
+
+    const finish = () => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      resolve(lineNo);
+    };
+
+    stream.on("data", (chunk) => {
+      if (stopped) {
+        return;
+      }
+      buffer += decoder.decode(chunk, { stream: true });
+      let idx = buffer.indexOf("\n");
+      while (idx !== -1 && !stopped) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        lineNo += 1;
+        const keepGoing = onLine(line, lineNo);
+        if (keepGoing === false) {
+          stopped = true;
+          stream.destroy();
+          return;
+        }
+        idx = buffer.indexOf("\n");
+      }
+    });
+
+    stream.on("end", () => {
+      if (stopped) {
+        finish();
+        return;
+      }
+      buffer += decoder.decode();
+      if (buffer.length > 0) {
+        lineNo += 1;
+        onLine(buffer, lineNo);
+      }
+      finish();
+    });
+
+    stream.on("close", () => {
+      if (stopped) {
+        finish();
+      }
+    });
+
+    stream.on("error", (err) => {
+      if (stopped) {
+        finish();
+        return;
+      }
+      reject(err);
+    });
+  });
+}
+
+function readFilteredMatches({
+  filePath,
+  pattern,
+  startMatch,
+  matchLimit,
+  charset,
+  verbose,
+}) {
+  let regex;
+  try {
+    regex = new RegExp(pattern);
+  } catch (err) {
+    return Promise.reject(new Error("Invalid regex"));
+  }
+
+  const matches = [];
+  let matchIndex = 0;
+  let stopped = false;
+
+  return scanFileLines(filePath, charset, (line, lineNo) => {
+    if (regex.global) {
+      regex.lastIndex = 0;
+    }
+    if (regex.test(line)) {
+      if (matchIndex >= startMatch && matches.length < matchLimit) {
+        matches.push({ lineNo, text: line });
+      }
+      matchIndex += 1;
+      if (matches.length >= matchLimit) {
+        stopped = true;
+        return false;
+      }
+    }
+    return true;
+  })
+    .then(() => ({
+      matches,
+      startMatch,
+      hasMore: stopped,
+    }))
+    .catch((err) => {
+      if (verbose) {
+        process.stderr.write(`[error] ${err.stack || err.message}\n`);
+      }
+      throw err;
+    });
+}
+
+function countMatches({ filePath, pattern, charset, verbose }) {
+  let regex;
+  try {
+    regex = new RegExp(pattern);
+  } catch (err) {
+    return Promise.reject(new Error("Invalid regex"));
+  }
+
+  let count = 0;
+  return scanFileLines(filePath, charset, (line) => {
+    if (regex.global) {
+      regex.lastIndex = 0;
+    }
+    if (regex.test(line)) {
+      count += 1;
+    }
+    return true;
+  })
+    .then(() => count)
+    .catch((err) => {
+      if (verbose) {
+        process.stderr.write(`[error] ${err.stack || err.message}\n`);
+      }
+      throw err;
+    });
 }
 
 function readLineChunk({
@@ -358,6 +500,89 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
             process.stderr.write(`[error] ${err.stack || err.message}\n`);
           }
           send(res, 500, "Failed to read log");
+          return;
+        }
+      }
+
+      if (parsed.pathname === "/api/filter") {
+        const fileId = parsed.searchParams.get("file") || defaultFileId;
+        const selected = getFileInfo(fileId);
+        if (!selected) {
+          send(res, 400, "Unknown file");
+          return;
+        }
+        const pattern = parsed.searchParams.get("pattern") || "";
+        const startMatch = Number(parsed.searchParams.get("startMatch") || 0);
+        const matchLimit = Number(parsed.searchParams.get("matches") || CHUNK_LINES);
+        const charsetParam = normalizeCharset(
+          parsed.searchParams.get("charset") || defaultCharset
+        );
+
+        if (!pattern) {
+          send(res, 400, "Missing pattern");
+          return;
+        }
+        if (Number.isNaN(startMatch) || Number.isNaN(matchLimit)) {
+          send(res, 400, "Invalid startMatch or matches");
+          return;
+        }
+
+        try {
+          const result = await readFilteredMatches({
+            filePath: selected.filePath,
+            pattern,
+            startMatch: Math.max(0, startMatch),
+            matchLimit: Math.max(1, Math.min(matchLimit, CHUNK_LINES * 2)),
+            charset: charsetParam,
+            verbose,
+          });
+          send(res, 200, JSON.stringify(result), "application/json; charset=utf-8");
+          return;
+        } catch (err) {
+          if (verbose) {
+            process.stderr.write(`[error] ${err.stack || err.message}\n`);
+          }
+          send(res, 400, "Invalid filter");
+          return;
+        }
+      }
+
+      if (parsed.pathname === "/api/match-count") {
+        const fileId = parsed.searchParams.get("file") || defaultFileId;
+        const selected = getFileInfo(fileId);
+        if (!selected) {
+          send(res, 400, "Unknown file");
+          return;
+        }
+        const pattern = parsed.searchParams.get("pattern") || "";
+        const charsetParam = normalizeCharset(
+          parsed.searchParams.get("charset") || defaultCharset
+        );
+        if (!pattern) {
+          send(res, 400, "Missing pattern");
+          return;
+        }
+        const cacheKey = `${selected.filePath}::${charsetParam}::${pattern}`;
+        if (MATCH_COUNT_CACHE.has(cacheKey)) {
+          const cached = MATCH_COUNT_CACHE.get(cacheKey);
+          send(res, 200, JSON.stringify({ count: cached }), "application/json; charset=utf-8");
+          return;
+        }
+        try {
+          const count = await countMatches({
+            filePath: selected.filePath,
+            pattern,
+            charset: charsetParam,
+            verbose,
+          });
+          MATCH_COUNT_CACHE.set(cacheKey, count);
+          send(res, 200, JSON.stringify({ count }), "application/json; charset=utf-8");
+          return;
+        } catch (err) {
+          if (verbose) {
+            process.stderr.write(`[error] ${err.stack || err.message}\n`);
+          }
+          send(res, 400, "Invalid filter");
           return;
         }
       }

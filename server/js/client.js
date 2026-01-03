@@ -40,6 +40,12 @@
   let categoryMatchers = [];
   let categoriesKey = null;
   let soloRestoreScrollTop = null;
+  let soloCategoryId = null;
+  let soloMatchCount = null;
+  let soloChunkLines = [];
+  let soloChunkLineNumbers = [];
+  let soloChunkStart = 0;
+  let soloRefreshTimer = null;
 
   function formatBytes(bytes) {
     if (bytes < 1024) {
@@ -91,6 +97,12 @@
   function getEffectiveLineCount() {
     if (!meta) {
       return 1;
+    }
+    if (soloCategoryId) {
+      if (soloMatchCount != null) {
+        return Math.max(1, soloMatchCount);
+      }
+      return Math.max(1, currentRangeEnd - currentRangeStart);
     }
     if (meta.lineCount != null) {
       return Math.max(1, meta.lineCount);
@@ -257,10 +269,14 @@
   function updateCategories(nextCategories) {
     categories = nextCategories;
     normalizeSolo();
+    soloCategoryId = categories.find((category) => category.solo)?.id || null;
     compileCategories();
     saveCategories();
     renderCategoryList();
-    renderChunk(rawChunkText, rawChunkStart);
+    rerenderCurrentView();
+    if (soloCategoryId) {
+      scheduleSoloRefresh();
+    }
   }
 
   function renderCategoryList() {
@@ -371,12 +387,9 @@
         }
         updateCategories([...categories]);
         if (!wasSolo) {
-          await scrollToFirstMatch(category);
-        } else if (soloRestoreScrollTop != null) {
-          scrollArea.scrollTop = soloRestoreScrollTop;
-          soloRestoreScrollTop = null;
-          const restoreLine = Math.floor(scrollArea.scrollTop / lineHeight);
-          await loadChunk(restoreLine, { force: true });
+          await activateSolo(category);
+        } else {
+          await deactivateSolo();
         }
       };
       actionRow.appendChild(soloButton);
@@ -420,54 +433,92 @@
     updateCategories(next);
   }
 
-  async function scrollToFirstMatch(category) {
+  function scheduleSoloRefresh() {
+    if (!soloCategoryId) {
+      return;
+    }
+    if (soloRefreshTimer) {
+      clearTimeout(soloRefreshTimer);
+    }
+    soloRefreshTimer = setTimeout(async () => {
+      soloMatchCount = null;
+      await fetchMatchCount();
+      setSpacerHeight();
+      scrollArea.scrollTop = 0;
+      await loadSoloChunk(0, { force: true });
+    }, 200);
+  }
+
+  async function activateSolo(category) {
     if (!meta) {
       return;
     }
-    const matcher = categoryMatchers.find(
-      (entry) => entry.category.id === category.id
-    );
-    if (!matcher || !matcher.regex) {
-      scrollArea.scrollTop = 0;
-      await loadChunk(0, { force: true });
-      return;
-    }
-    const chunkLines = meta.chunkLines || 200;
-    const maxLines = meta.lineCount != null ? meta.lineCount : null;
-    let startLine = 0;
-    while (maxLines == null || startLine < maxLines) {
-      // eslint-disable-next-line no-await-in-loop
-      const text = await fetchChunk(startLine);
-      const lines = text.split("\n");
-      if (lines.length === 0 || (lines.length === 1 && lines[0] === "")) {
-        break;
-      }
-      if (text.endsWith("\n")) {
-        lines.pop();
-      }
-      for (let index = 0; index < lines.length; index += 1) {
-        const line = lines[index];
-        if (matcher.regex.global) {
-          matcher.regex.lastIndex = 0;
-        }
-        if (matcher.regex.test(line)) {
-          const targetLine = startLine + index;
-          const targetTop = targetLine * lineHeight;
-          scrollArea.scrollTop = targetTop;
-          await loadChunk(targetLine, { force: true });
-          await new Promise((resolve) => {
-            window.requestAnimationFrame(() => resolve());
-          });
-          scrollArea.scrollTop = targetTop;
-          return;
-        }
-      }
-      if (lines.length < chunkLines) {
-        break;
-      }
-      startLine += chunkLines;
-    }
+    soloCategoryId = category.id;
+    soloMatchCount = null;
+    soloChunkLines = [];
+    soloChunkLineNumbers = [];
+    soloChunkStart = 0;
     scrollArea.scrollTop = 0;
+    await fetchMatchCount();
+    setSpacerHeight();
+    await loadSoloChunk(0, { force: true });
+  }
+
+  async function deactivateSolo() {
+    soloCategoryId = null;
+    soloMatchCount = null;
+    soloChunkLines = [];
+    soloChunkLineNumbers = [];
+    soloChunkStart = 0;
+    setSpacerHeight();
+    if (soloRestoreScrollTop != null) {
+      scrollArea.scrollTop = soloRestoreScrollTop;
+      soloRestoreScrollTop = null;
+      const restoreLine = Math.floor(scrollArea.scrollTop / lineHeight);
+      await loadChunk(restoreLine, { force: true });
+    } else {
+      await loadChunk(currentRangeStart, { force: true });
+    }
+  }
+
+  function renderLines({
+    lines,
+    lineNumbersList,
+    startIndex,
+    totalCount,
+    rangeLabel,
+    markColor,
+  }) {
+    const width = String(Math.max(1, totalCount || 1)).length;
+    const lineNumbersBuffer = [];
+    const contentBuffer = [];
+
+    lines.forEach((line, index) => {
+      const classes = ["log-line"];
+      let style = "";
+      if (markColor) {
+        classes.push("marked");
+        style = ` style="--mark-color: ${markColor}"`;
+      }
+      const safeLine = line.length === 0 ? "&nbsp;" : escapeHtml(line);
+      contentBuffer.push(
+        `<span class="${classes.join(" ")}"${style}>${safeLine}</span>`
+      );
+      if (lineNumbersEnabled) {
+        const lineNo = lineNumbersList[index];
+        lineNumbersBuffer.push(String(lineNo).padStart(width, " "));
+      }
+    });
+
+    logContent.innerHTML = contentBuffer.join("");
+    logRow.style.top = `${startIndex * lineHeight}px`;
+    logRow.style.transform = "translateY(0)";
+    if (lineNumbersEnabled) {
+      lineNumbers.textContent = lineNumbersBuffer.join("\n");
+    } else {
+      lineNumbers.textContent = "";
+    }
+    rangeMeta.textContent = rangeLabel;
   }
 
   function renderChunk(text, startLine) {
@@ -477,13 +528,10 @@
     if (rawChunkText.endsWith("\n")) {
       lines = lines.slice(0, -1);
     }
-    const soloCategory = categories.find((category) => category.solo);
     const totalLines =
       meta && meta.lineCount != null ? meta.lineCount : startLine + lines.length;
-    const width = String(Math.max(1, totalLines)).length;
-    const lineNumbersBuffer = [];
+    const lineNumbersList = [];
     const contentBuffer = [];
-    const visibleLineNumbers = [];
 
     lines.forEach((line, index) => {
       const lineNo = startLine + index + 1;
@@ -501,16 +549,14 @@
         return;
       }
       const soloMatch =
-        !soloCategory ||
-        matches.some((matcher) => matcher.category.id === soloCategory.id);
+        !soloCategoryId ||
+        matches.some((matcher) => matcher.category.id === soloCategoryId);
 
       if (!soloMatch) {
         return;
       }
 
-      const marked = soloCategory
-        ? matches.find((matcher) => matcher.category.id === soloCategory.id)
-        : matches[0];
+      const marked = matches.length > 0 ? matches[0] : null;
       const classes = ["log-line"];
       let style = "";
       if (marked) {
@@ -521,36 +567,78 @@
       contentBuffer.push(
         `<span class="${classes.join(" ")}"${style}>${safeLine}</span>`
       );
-      if (lineNumbersEnabled) {
-        lineNumbersBuffer.push(String(lineNo).padStart(width, " "));
-      }
-      visibleLineNumbers.push(lineNo);
+      lineNumbersList.push(lineNo);
     });
+
+    const rangeLabel = (() => {
+      const lineCount = countLinesInText(rawChunkText);
+      currentRangeStart = startLine;
+      currentRangeEnd = startLine + lineCount;
+      return buildRangeLabel(startLine, lineCount);
+    })();
 
     logContent.innerHTML = contentBuffer.join("");
     logRow.style.top = `${startLine * lineHeight}px`;
     logRow.style.transform = "translateY(0)";
     if (lineNumbersEnabled) {
-      lineNumbers.textContent = lineNumbersBuffer.join("\n");
+      const width = String(Math.max(1, totalLines)).length;
+      lineNumbers.textContent = lineNumbersList
+        .map((lineNo) => String(lineNo).padStart(width, " "))
+        .join("\n");
     } else {
       lineNumbers.textContent = "";
     }
-    const lineCount = countLinesInText(rawChunkText);
-    currentRangeStart = startLine;
-    currentRangeEnd = startLine + lineCount;
-    if (soloCategory && visibleLineNumbers.length > 0) {
-      const first = visibleLineNumbers[0];
-      const last = visibleLineNumbers[visibleLineNumbers.length - 1];
-      if (meta && meta.lineCount != null) {
-        rangeMeta.textContent = `Lines ${first.toLocaleString()} - ${last.toLocaleString()} of ${meta.lineCount.toLocaleString()} (solo)`;
-      } else {
-        rangeMeta.textContent = `Lines ${first.toLocaleString()} - ${last.toLocaleString()} (solo)`;
-      }
-    } else if (soloCategory) {
-      rangeMeta.textContent = "No matching lines in view (solo)";
+    rangeMeta.textContent = rangeLabel;
+  }
+
+  function renderSoloChunk(lines, lineNumbersList, startMatch) {
+    soloChunkLines = lines;
+    soloChunkLineNumbers = lineNumbersList;
+    soloChunkStart = startMatch;
+    const totalMatches = soloMatchCount || startMatch + lines.length;
+    currentRangeStart = startMatch;
+    currentRangeEnd = startMatch + lines.length;
+    const soloCategory = categories.find((category) => category.id === soloCategoryId);
+    const markColor = soloCategory ? soloCategory.color : null;
+    const rangeLabel = buildMatchRangeLabel(startMatch, lines.length, totalMatches);
+    renderLines({
+      lines,
+      lineNumbersList,
+      startIndex: startMatch,
+      totalCount: totalMatches,
+      rangeLabel,
+      markColor,
+    });
+  }
+
+  function rerenderCurrentView() {
+    if (soloCategoryId) {
+      renderSoloChunk(soloChunkLines, soloChunkLineNumbers, soloChunkStart);
     } else {
-      updateRange(startLine, lineCount);
+      renderChunk(rawChunkText, rawChunkStart);
     }
+  }
+
+  function buildRangeLabel(startLine, lineCount) {
+    const endLine = startLine + Math.max(0, lineCount - 1);
+    const startLabel = startLine + 1;
+    const endLabel = Math.max(startLabel, endLine + 1);
+    if (meta && meta.lineCount != null) {
+      return `Lines ${startLabel.toLocaleString()} - ${endLabel.toLocaleString()} of ${meta.lineCount.toLocaleString()}`;
+    }
+    return `Lines ${startLabel.toLocaleString()} - ${endLabel.toLocaleString()}`;
+  }
+
+  function buildMatchRangeLabel(startMatch, count, totalMatches) {
+    if (count === 0) {
+      return "No matching lines";
+    }
+    const startLabel = startMatch + 1;
+    const endLabel = startMatch + count;
+    if (totalMatches != null) {
+      return `Matches ${startLabel.toLocaleString()} - ${endLabel.toLocaleString()} of ${totalMatches.toLocaleString()}`;
+    }
+    return `Matches ${startLabel.toLocaleString()} - ${endLabel.toLocaleString()}`;
   }
 
   function normalizeWindowStart(startLine) {
@@ -573,6 +661,44 @@
       throw new Error("Chunk fetch failed");
     }
     return response.text();
+  }
+
+  async function fetchSoloChunk(startMatch) {
+    const chunkLines = meta.chunkLines || 200;
+    const soloCategory = categories.find((category) => category.id === soloCategoryId);
+    const pattern = soloCategory ? soloCategory.pattern : "";
+    const url = `/api/filter?file=${encodeURIComponent(
+      currentFileId || ""
+    )}&pattern=${encodeURIComponent(pattern)}&startMatch=${startMatch}&matches=${chunkLines}&charset=${encodeURIComponent(
+      currentCharset || ""
+    )}`;
+    const response = await fetch(url, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error("Filtered fetch failed");
+    }
+    return response.json();
+  }
+
+  async function fetchMatchCount() {
+    const soloCategory = categories.find((category) => category.id === soloCategoryId);
+    if (!soloCategory || !soloCategory.pattern) {
+      soloMatchCount = 0;
+      return;
+    }
+    const url = `/api/match-count?file=${encodeURIComponent(
+      currentFileId || ""
+    )}&pattern=${encodeURIComponent(soloCategory.pattern)}&charset=${encodeURIComponent(
+      currentCharset || ""
+    )}`;
+    const response = await fetch(url, { cache: "no-store" });
+    if (!response.ok) {
+      return;
+    }
+    const payload = await response.json();
+    if (typeof payload.count === "number") {
+      soloMatchCount = payload.count;
+      setSpacerHeight();
+    }
   }
 
   function startPrefetch(startLine) {
@@ -647,11 +773,58 @@
     }
   }
 
+  async function loadSoloChunk(startMatch, options) {
+    if (!meta) {
+      return;
+    }
+    const force = options && options.force;
+    if (pending) {
+      queuedStart = startMatch;
+      return;
+    }
+    const chunkLines = meta.chunkLines || 200;
+    const normalizedStart = Math.max(0, Math.floor(startMatch / chunkLines) * chunkLines);
+    if (!force && (normalizedStart === currentRangeStart || normalizedStart === pendingStart)) {
+      return;
+    }
+    pending = true;
+    pendingStart = normalizedStart;
+    try {
+      const result = await fetchSoloChunk(normalizedStart);
+      const soloCategory = categories.find(
+        (category) => category.id === soloCategoryId
+      );
+      if (soloCategory && soloCategory.hidden) {
+        renderSoloChunk([], [], normalizedStart);
+      } else {
+        const lines = result.matches.map((entry) => entry.text);
+        const lineNumbersList = result.matches.map((entry) => entry.lineNo);
+        renderSoloChunk(lines, lineNumbersList, normalizedStart);
+      }
+    } catch (err) {
+      renderSoloChunk([], [], normalizedStart);
+    } finally {
+      pending = false;
+      pendingStart = null;
+      if (queuedStart !== null) {
+        const nextStart = queuedStart;
+        queuedStart = null;
+        loadSoloChunk(nextStart);
+      }
+    }
+  }
+
   function onScroll() {
     if (!meta) {
       return;
     }
     const line = Math.floor(scrollArea.scrollTop / lineHeight);
+    if (soloCategoryId) {
+      if (line < currentRangeStart || line >= currentRangeEnd) {
+        loadSoloChunk(line);
+      }
+      return;
+    }
     const chunkLines = meta.chunkLines || 200;
     const preloadLines = Math.max(20, Math.floor(chunkLines / 4));
     if (line >= currentRangeEnd - preloadLines) {
@@ -686,7 +859,7 @@
     lineNumbersToggle.addEventListener("change", () => {
       lineNumbersEnabled = lineNumbersToggle.checked;
       document.body.classList.toggle("line-numbers-off", !lineNumbersEnabled);
-      renderChunk(rawChunkText, rawChunkStart);
+      rerenderCurrentView();
     });
   }
 
@@ -711,7 +884,11 @@
       prefetched = null;
       prefetchPromise = null;
       pendingStart = null;
-      loadChunk(currentLine, { force: true });
+      if (soloCategoryId) {
+        scheduleSoloRefresh();
+      } else {
+        loadChunk(currentLine, { force: true });
+      }
     };
   }
 
@@ -737,6 +914,11 @@
       prefetched = null;
       prefetchPromise = null;
       pending = false;
+      soloCategoryId = null;
+      soloMatchCount = null;
+      soloChunkLines = [];
+      soloChunkLineNumbers = [];
+      soloChunkStart = 0;
       scrollArea.scrollTop = 0;
       await refreshMeta();
       await loadChunk(0, { force: true });
@@ -784,6 +966,11 @@
       currentCharset = meta.charset;
       currentFileId = meta.fileId;
       lineNumbersEnabled = Boolean(meta.lineNumbers);
+      soloCategoryId = null;
+      soloMatchCount = null;
+      soloChunkLines = [];
+      soloChunkLineNumbers = [];
+      soloChunkStart = 0;
       lineHeight = getLineHeightPx();
       updateFileMeta();
       setSpacerHeight();
