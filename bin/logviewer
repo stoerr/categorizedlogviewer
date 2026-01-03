@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const net = require("net");
+const { spawn } = require("child_process");
+
+function printHelp() {
+  const helpText = `logviewer - view a logfile in a browser\n\nUsage:\n  logviewer [options] <logfile>\n\nOptions:\n  --wrap           Wrap long lines\n  --no-wrap        Do not wrap long lines (default)\n  -h, --help, -?   Show this help\n`;
+  process.stdout.write(helpText);
+}
+
+function isHelpArg(arg) {
+  return arg === "-h" || arg === "--help" || arg === "-?";
+}
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  if (args.length === 0 || args.some(isHelpArg)) {
+    return { help: true };
+  }
+
+  let wrap = false;
+  let filePath = null;
+
+  for (const arg of args) {
+    if (arg === "--wrap") {
+      wrap = true;
+    } else if (arg === "--no-wrap") {
+      wrap = false;
+    } else if (!filePath) {
+      filePath = arg;
+    } else {
+      return { error: `Unexpected argument: ${arg}` };
+    }
+  }
+
+  if (!filePath) {
+    return { error: "Missing logfile path" };
+  }
+
+  return { filePath, wrap };
+}
+
+function fileExists(filePath) {
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch (err) {
+    return false;
+  }
+}
+
+function pickPort(startPort, range) {
+  const candidates = [];
+  for (let i = 0; i < range; i += 1) {
+    candidates.push(startPort + i);
+  }
+  // Simple shuffle for randomness
+  for (let i = candidates.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+  }
+
+  return new Promise((resolve, reject) => {
+    let index = 0;
+
+    const tryNext = () => {
+      if (index >= candidates.length) {
+        reject(new Error("No free port found"));
+        return;
+      }
+
+      const port = candidates[index++];
+      const server = net.createServer();
+      server.unref();
+      server.on("error", () => {
+        tryNext();
+      });
+      server.listen(port, "127.0.0.1", () => {
+        const selected = server.address().port;
+        server.close(() => resolve(selected));
+      });
+    };
+
+    tryNext();
+  });
+}
+
+async function main() {
+  const parsed = parseArgs(process.argv);
+  if (parsed.help) {
+    printHelp();
+    return;
+  }
+  if (parsed.error) {
+    process.stderr.write(`${parsed.error}\n\n`);
+    printHelp();
+    process.exit(1);
+  }
+
+  const absoluteFilePath = path.resolve(process.cwd(), parsed.filePath);
+  if (!fileExists(absoluteFilePath)) {
+    process.stderr.write(`Logfile not found: ${absoluteFilePath}\n`);
+    process.exit(1);
+  }
+
+  const scriptPath = fs.realpathSync(__filename);
+  const scriptDir = path.dirname(scriptPath);
+  const serverRoot = path.resolve(scriptDir, "..", "server");
+  const serverPath = path.join(serverRoot, "js", "server.js");
+
+  if (!fileExists(serverPath)) {
+    process.stderr.write(`Server entry not found: ${serverPath}\n`);
+    process.exit(1);
+  }
+
+  const port = await pickPort(3223, 200);
+  const serverModule = require(serverPath);
+  const server = await serverModule.start({
+    port,
+    filePath: absoluteFilePath,
+    wrap: parsed.wrap,
+  });
+
+  const url = `http://127.0.0.1:${port}/`;
+  process.stdout.write(`Serving ${absoluteFilePath}\n${url}\n`);
+
+  if (process.platform === "darwin") {
+    const child = spawn("open", [url], { stdio: "ignore" });
+    child.on("error", () => {
+      process.stderr.write("Failed to open browser.\n");
+    });
+  }
+
+  const shutdown = () => {
+    server.close(() => {
+      process.exit(0);
+    });
+  };
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+main().catch((err) => {
+  process.stderr.write(`${err.message}\n`);
+  process.exit(1);
+});
