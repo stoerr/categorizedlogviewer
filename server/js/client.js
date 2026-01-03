@@ -22,7 +22,6 @@
   let lineHeight = 16;
   let currentRangeStart = 0;
   let currentRangeEnd = 0;
-  let pendingStart = null;
   let currentCharset = null;
   let currentFileId = null;
   let lineNumbersEnabled = false;
