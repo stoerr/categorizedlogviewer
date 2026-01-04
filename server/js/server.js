@@ -159,11 +159,12 @@ function readFilteredMatches({
   startMatch,
   matchLimit,
   charset,
+  mode,
   verbose,
 }) {
   let regex;
   try {
-    regex = new RegExp(pattern);
+    regex = new RegExp(pattern, "i");
   } catch (err) {
     return Promise.reject(new Error("Invalid regex"));
   }
@@ -176,7 +177,9 @@ function readFilteredMatches({
     if (regex.global) {
       regex.lastIndex = 0;
     }
-    if (regex.test(line)) {
+    const isMatch = regex.test(line);
+    const include = mode === "exclude" ? !isMatch : isMatch;
+    if (include) {
       if (matchIndex >= startMatch && matches.length < matchLimit) {
         matches.push({ lineNo, text: line });
       }
@@ -201,10 +204,10 @@ function readFilteredMatches({
     });
 }
 
-function countMatches({ filePath, pattern, charset, verbose }) {
+function countMatches({ filePath, pattern, charset, mode, verbose }) {
   let regex;
   try {
-    regex = new RegExp(pattern);
+    regex = new RegExp(pattern, "i");
   } catch (err) {
     return Promise.reject(new Error("Invalid regex"));
   }
@@ -214,7 +217,9 @@ function countMatches({ filePath, pattern, charset, verbose }) {
     if (regex.global) {
       regex.lastIndex = 0;
     }
-    if (regex.test(line)) {
+    const isMatch = regex.test(line);
+    const include = mode === "exclude" ? !isMatch : isMatch;
+    if (include) {
       count += 1;
     }
     return true;
@@ -512,6 +517,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
           return;
         }
         const pattern = parsed.searchParams.get("pattern") || "";
+        const mode = parsed.searchParams.get("mode") || "include";
         const startMatch = Number(parsed.searchParams.get("startMatch") || 0);
         const matchLimit = Number(parsed.searchParams.get("matches") || CHUNK_LINES);
         const charsetParam = normalizeCharset(
@@ -520,6 +526,10 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
 
         if (!pattern) {
           send(res, 400, "Missing pattern");
+          return;
+        }
+        if (mode !== "include" && mode !== "exclude") {
+          send(res, 400, "Invalid mode");
           return;
         }
         if (Number.isNaN(startMatch) || Number.isNaN(matchLimit)) {
@@ -534,6 +544,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
             startMatch: Math.max(0, startMatch),
             matchLimit: Math.max(1, Math.min(matchLimit, CHUNK_LINES * 2)),
             charset: charsetParam,
+            mode,
             verbose,
           });
           send(res, 200, JSON.stringify(result), "application/json; charset=utf-8");
@@ -555,6 +566,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
           return;
         }
         const pattern = parsed.searchParams.get("pattern") || "";
+        const mode = parsed.searchParams.get("mode") || "include";
         const charsetParam = normalizeCharset(
           parsed.searchParams.get("charset") || defaultCharset
         );
@@ -562,7 +574,11 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
           send(res, 400, "Missing pattern");
           return;
         }
-        const cacheKey = `${selected.filePath}::${charsetParam}::${pattern}`;
+        if (mode !== "include" && mode !== "exclude") {
+          send(res, 400, "Invalid mode");
+          return;
+        }
+        const cacheKey = `${selected.filePath}::${charsetParam}::${mode}::${pattern}`;
         if (MATCH_COUNT_CACHE.has(cacheKey)) {
           const cached = MATCH_COUNT_CACHE.get(cacheKey);
           send(res, 200, JSON.stringify({ count: cached }), "application/json; charset=utf-8");
@@ -573,6 +589,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
             filePath: selected.filePath,
             pattern,
             charset: charsetParam,
+            mode,
             verbose,
           });
           MATCH_COUNT_CACHE.set(cacheKey, count);
