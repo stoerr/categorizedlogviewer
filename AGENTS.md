@@ -28,9 +28,11 @@ There is no build step or package manager in this repo; run the CLI directly wit
 There is no automated test suite yet. Validate changes manually:
 - Start the server with a real log file.
 - Scroll to confirm virtualized content loads correctly.
+- Use the header search box to filter by regex; confirm hidden categories still exclude matches.
 - Toggle `--wrap` to verify both layout modes.
 - Switch charsets and files when multiple paths are provided.
 - Enable line numbers and confirm copying log text excludes the gutter.
+- Select non-contiguous lines via checkboxes and create a category with `AI Add` (requires `OPENAI_API_KEY`).
 
 ## Commit & Pull Request Guidelines
 History is minimal and does not show a strict convention. Use concise, imperative commit messages (e.g., `Add chunked tail rendering`).
@@ -42,3 +44,4 @@ For pull requests, include:
 ## Configuration & External Dependencies
 - HTML loads Bootstrap from a CDN; keep integrity/crossorigin attributes intact.
 - Fonts are pulled from Google Fonts in `server/css/style.css`.
+- AI suggestions use `OPENAI_API_KEY` and optional `OPENAI_MODEL`/`OPENAI_API_URL` environment variables.
