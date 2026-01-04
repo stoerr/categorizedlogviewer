@@ -8,6 +8,9 @@ const CHUNK_LINES = 400;
 const INDEX_STRIDE = 1000;
 const MAX_CHUNK_BYTES = 512 * 1024;
 const DEFAULT_CHARSET = "utf-8";
+const DEFAULT_AI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
+const OPENAI_API_URL =
+  process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions";
 const CHARSET_OPTIONS = [
   "utf-8",
   "iso-8859-1",
@@ -15,6 +18,9 @@ const CHARSET_OPTIONS = [
   "windows-1252",
 ];
 const MATCH_COUNT_CACHE = new Map();
+const MAX_AI_LINES = 50;
+const MAX_AI_TOTAL_CHARS = 8000;
+const MAX_AI_LINE_CHARS = 1000;
 
 function normalizeCharset(value) {
   if (!value) {
@@ -155,6 +161,8 @@ function scanFileLines(filePath, charset, onLine) {
 
 function readFilteredMatches({
   filePath,
+  includePattern,
+  excludePattern,
   pattern,
   startMatch,
   matchLimit,
@@ -162,11 +170,30 @@ function readFilteredMatches({
   mode,
   verbose,
 }) {
-  let regex;
-  try {
-    regex = new RegExp(pattern, "i");
-  } catch (err) {
-    return Promise.reject(new Error("Invalid regex"));
+  const includeSource = includePattern || (mode === "exclude" ? "" : pattern) || "";
+  const excludeSource = excludePattern || (mode === "exclude" ? pattern : "") || "";
+
+  let includeRegex = null;
+  let excludeRegex = null;
+
+  if (!includeSource && !excludeSource) {
+    return Promise.reject(new Error("Missing pattern"));
+  }
+
+  if (includeSource) {
+    try {
+      includeRegex = new RegExp(includeSource, "i");
+    } catch (err) {
+      return Promise.reject(new Error("Invalid include regex"));
+    }
+  }
+
+  if (excludeSource) {
+    try {
+      excludeRegex = new RegExp(excludeSource, "i");
+    } catch (err) {
+      return Promise.reject(new Error("Invalid exclude regex"));
+    }
   }
 
   const matches = [];
@@ -174,11 +201,15 @@ function readFilteredMatches({
   let stopped = false;
 
   return scanFileLines(filePath, charset, (line, lineNo) => {
-    if (regex.global) {
-      regex.lastIndex = 0;
+    if (includeRegex && includeRegex.global) {
+      includeRegex.lastIndex = 0;
     }
-    const isMatch = regex.test(line);
-    const include = mode === "exclude" ? !isMatch : isMatch;
+    if (excludeRegex && excludeRegex.global) {
+      excludeRegex.lastIndex = 0;
+    }
+    const includeOk = includeRegex ? includeRegex.test(line) : true;
+    const excludeHit = excludeRegex ? excludeRegex.test(line) : false;
+    const include = includeOk && !excludeHit;
     if (include) {
       if (matchIndex >= startMatch && matches.length < matchLimit) {
         matches.push({ lineNo, text: line });
@@ -204,22 +235,50 @@ function readFilteredMatches({
     });
 }
 
-function countMatches({ filePath, pattern, charset, mode, verbose }) {
-  let regex;
-  try {
-    regex = new RegExp(pattern, "i");
-  } catch (err) {
-    return Promise.reject(new Error("Invalid regex"));
+function countMatches({
+  filePath,
+  includePattern,
+  excludePattern,
+  pattern,
+  charset,
+  mode,
+  verbose,
+}) {
+  const includeSource = includePattern || (mode === "exclude" ? "" : pattern) || "";
+  const excludeSource = excludePattern || (mode === "exclude" ? pattern : "") || "";
+  let includeRegex = null;
+  let excludeRegex = null;
+
+  if (!includeSource && !excludeSource) {
+    return Promise.reject(new Error("Missing pattern"));
+  }
+
+  if (includeSource) {
+    try {
+      includeRegex = new RegExp(includeSource, "i");
+    } catch (err) {
+      return Promise.reject(new Error("Invalid include regex"));
+    }
+  }
+  if (excludeSource) {
+    try {
+      excludeRegex = new RegExp(excludeSource, "i");
+    } catch (err) {
+      return Promise.reject(new Error("Invalid exclude regex"));
+    }
   }
 
   let count = 0;
   return scanFileLines(filePath, charset, (line) => {
-    if (regex.global) {
-      regex.lastIndex = 0;
+    if (includeRegex && includeRegex.global) {
+      includeRegex.lastIndex = 0;
     }
-    const isMatch = regex.test(line);
-    const include = mode === "exclude" ? !isMatch : isMatch;
-    if (include) {
+    if (excludeRegex && excludeRegex.global) {
+      excludeRegex.lastIndex = 0;
+    }
+    const includeOk = includeRegex ? includeRegex.test(line) : true;
+    const excludeHit = excludeRegex ? excludeRegex.test(line) : false;
+    if (includeOk && !excludeHit) {
       count += 1;
     }
     return true;
@@ -365,6 +424,100 @@ function serveFile(res, filePath, contentType) {
   } catch (err) {
     send(res, 404, "Not found");
   }
+}
+
+function readJsonBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (limit && body.length > limit) {
+        reject(new Error("Payload too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(body));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on("error", (err) => reject(err));
+  });
+}
+
+async function requestRegexSuggestions({ lines, apiKey, apiUrl, model, verbose }) {
+  const systemPrompt =
+    'You are helping categorize log lines. Suggest concise JavaScript regular expressions (without delimiters or flags) that are found in all of the provided lines and likely differentiate them from other lines in a file. If a portion varies, use a simple wildcard like ".*" instead of overfitting. Prefer to match plain text parts and not numbers or identifiers. Avoid anchors unless required; do not include inline flags. Respond ONLY with a JSON object shaped as {"suggestions":["<regex>","<regex>"]} containing 3-6 options of increasing complexity.';
+  const payload = {
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: JSON.stringify({ lines }) },
+    ],
+    response_format: { type: "json_object" },
+    temperature: 0.2,
+  };
+  if (verbose) {
+    process.stdout.write(`[ai-request] ${JSON.stringify(payload)}\n`);
+  }
+  const response = await fetch(apiUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const message = `AI request failed with status ${response.status}`;
+    if (verbose) {
+      process.stderr.write(`[error] ${message}\n`);
+    }
+    throw new Error(message);
+  }
+  const result = await response.json();
+  const content = result?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error("AI response missing content");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (err) {
+    throw new Error("AI response was not valid JSON");
+  }
+  const suggestions = Array.isArray(parsed.suggestions)
+    ? parsed.suggestions.filter((entry) => typeof entry === "string")
+    : [];
+  return suggestions;
+}
+
+function filterMatchingSuggestions(lines, suggestions) {
+  const matching = [];
+  suggestions.forEach((pattern) => {
+    try {
+      const regex = new RegExp(pattern, "i");
+      const valid = lines.every((line) => {
+        if (regex.global) {
+          regex.lastIndex = 0;
+        }
+        return regex.test(line);
+      });
+      if (valid) {
+        matching.push(pattern);
+      }
+    } catch (err) {
+      // Ignore invalid patterns.
+    }
+  });
+  return matching;
 }
 
 function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
@@ -516,6 +669,8 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
           send(res, 400, "Unknown file");
           return;
         }
+        const includePattern = parsed.searchParams.get("include") || "";
+        const excludePattern = parsed.searchParams.get("exclude") || "";
         const pattern = parsed.searchParams.get("pattern") || "";
         const mode = parsed.searchParams.get("mode") || "include";
         const startMatch = Number(parsed.searchParams.get("startMatch") || 0);
@@ -524,12 +679,14 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
           parsed.searchParams.get("charset") || defaultCharset
         );
 
-        if (!pattern) {
-          send(res, 400, "Missing pattern");
-          return;
-        }
         if (mode !== "include" && mode !== "exclude") {
           send(res, 400, "Invalid mode");
+          return;
+        }
+        const include = includePattern || (mode === "exclude" ? "" : pattern);
+        const exclude = excludePattern || (mode === "exclude" ? pattern : "");
+        if (!include && !exclude) {
+          send(res, 400, "Missing pattern");
           return;
         }
         if (Number.isNaN(startMatch) || Number.isNaN(matchLimit)) {
@@ -540,7 +697,8 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
         try {
           const result = await readFilteredMatches({
             filePath: selected.filePath,
-            pattern,
+            includePattern: include || null,
+            excludePattern: exclude || null,
             startMatch: Math.max(0, startMatch),
             matchLimit: Math.max(1, Math.min(matchLimit, CHUNK_LINES * 2)),
             charset: charsetParam,
@@ -565,20 +723,24 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
           send(res, 400, "Unknown file");
           return;
         }
+        const includePattern = parsed.searchParams.get("include") || "";
+        const excludePattern = parsed.searchParams.get("exclude") || "";
         const pattern = parsed.searchParams.get("pattern") || "";
         const mode = parsed.searchParams.get("mode") || "include";
         const charsetParam = normalizeCharset(
           parsed.searchParams.get("charset") || defaultCharset
         );
-        if (!pattern) {
-          send(res, 400, "Missing pattern");
-          return;
-        }
         if (mode !== "include" && mode !== "exclude") {
           send(res, 400, "Invalid mode");
           return;
         }
-        const cacheKey = `${selected.filePath}::${charsetParam}::${mode}::${pattern}`;
+        const include = includePattern || (mode === "exclude" ? "" : pattern);
+        const exclude = excludePattern || (mode === "exclude" ? pattern : "");
+        if (!include && !exclude) {
+          send(res, 400, "Missing pattern");
+          return;
+        }
+        const cacheKey = `${selected.filePath}::${charsetParam}::${mode}::include:${include}::exclude:${exclude}`;
         if (MATCH_COUNT_CACHE.has(cacheKey)) {
           const cached = MATCH_COUNT_CACHE.get(cacheKey);
           send(res, 200, JSON.stringify({ count: cached }), "application/json; charset=utf-8");
@@ -587,6 +749,8 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
         try {
           const count = await countMatches({
             filePath: selected.filePath,
+            includePattern: include || null,
+            excludePattern: exclude || null,
             pattern,
             charset: charsetParam,
             mode,
@@ -600,6 +764,86 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
             process.stderr.write(`[error] ${err.stack || err.message}\n`);
           }
           send(res, 400, "Invalid filter");
+          return;
+        }
+      }
+
+      if (parsed.pathname === "/api/ai-suggest") {
+        if (req.method !== "POST") {
+          send(res, 405, JSON.stringify({ error: "Method not allowed" }), "application/json; charset=utf-8");
+          return;
+        }
+        const apiKey = process.env.OPENAI_API_KEY;
+        if (!apiKey) {
+          send(
+            res,
+            500,
+            JSON.stringify({ error: "AI suggestions are not configured" }),
+            "application/json; charset=utf-8"
+          );
+          return;
+        }
+        let payload;
+        try {
+          payload = await readJsonBody(req, 200000);
+        } catch (err) {
+          send(res, 400, JSON.stringify({ error: "Invalid JSON body" }), "application/json; charset=utf-8");
+          return;
+        }
+        const linesRaw = Array.isArray(payload.lines) ? payload.lines : [];
+        const lines = linesRaw
+          .filter((entry) => typeof entry === "string")
+          .map((line) => line.replace(/\r?\n/g, "").slice(0, MAX_AI_LINE_CHARS))
+          .filter((line) => line.trim().length > 0);
+        if (lines.length === 0) {
+          send(res, 400, JSON.stringify({ error: "No lines provided" }), "application/json; charset=utf-8");
+          return;
+        }
+        if (lines.length > MAX_AI_LINES) {
+          send(
+            res,
+            400,
+            JSON.stringify({ error: `Too many lines (max ${MAX_AI_LINES})` }),
+            "application/json; charset=utf-8"
+          );
+          return;
+        }
+        const totalChars = lines.reduce((sum, line) => sum + line.length, 0);
+        if (totalChars > MAX_AI_TOTAL_CHARS) {
+          send(
+            res,
+            400,
+            JSON.stringify({ error: "Selected text is too long" }),
+            "application/json; charset=utf-8"
+          );
+          return;
+        }
+        try {
+          const suggestions = await requestRegexSuggestions({
+            lines,
+            apiKey,
+            apiUrl: OPENAI_API_URL,
+            model: DEFAULT_AI_MODEL,
+            verbose,
+          });
+          const matching = filterMatchingSuggestions(lines, suggestions);
+          send(
+            res,
+            200,
+            JSON.stringify({
+              suggestions: matching,
+              totalReturned: suggestions.length,
+              rejected: suggestions.length - matching.length,
+            }),
+            "application/json; charset=utf-8"
+          );
+          return;
+        } catch (err) {
+          if (verbose) {
+            process.stderr.write(`[error] ${err.stack || err.message}\n`);
+          }
+          const message = err && err.message ? err.message : "Failed to fetch AI suggestions";
+          send(res, 500, JSON.stringify({ error: message }), "application/json; charset=utf-8");
           return;
         }
       }

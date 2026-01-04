@@ -12,13 +12,26 @@
   const charsetSelect = document.getElementById("charset-select");
   const fileSelect = document.getElementById("file-select");
   const lineNumbersToggle = document.getElementById("line-numbers-toggle");
+  const searchInput = document.getElementById("search-input");
   const addCategoryButton = document.getElementById("add-category");
   const categoryList = document.getElementById("category-list");
   const categoryEmpty = document.getElementById("category-empty");
+  const aiSuggestButton = document.getElementById("ai-suggest");
+  const aiDialog = document.getElementById("ai-dialog");
+  const aiCloseButton = document.getElementById("ai-close");
+  const aiSelection = document.getElementById("ai-selection");
+  const aiSuggestionList = document.getElementById("ai-suggestion-list");
+  const aiSuggestionStatus = document.getElementById("ai-suggestion-status");
+  const aiApplyButton = document.getElementById("ai-apply");
+  const aiRefreshButton = document.getElementById("ai-refresh");
+  const aiDialogBackdrop = aiDialog ? aiDialog.querySelector(".ai-dialog-backdrop") : null;
 
   const ESTIMATED_BYTES_PER_LINE = 80;
   const CATEGORY_STORAGE_PREFIX =
     "net.stoerr.Categorizedlogfileviewer.categories.com";
+  const MAX_AI_LINES = 50;
+  const MAX_AI_TOTAL_CHARS = 8000;
+  const MAX_AI_LINE_LENGTH = 1000;
 
   let meta = null;
   let pending = false;
@@ -51,6 +64,13 @@
   let filterPrefetchPromise = null;
   let renderedFilterChunks = [];
   let renderedChunks = [];
+  let aiSelectionLines = [];
+  let aiSuggestions = [];
+  let aiSelectedPattern = null;
+  let aiRequestInFlight = false;
+  let selectedLines = new Map();
+  let searchPattern = "";
+  let searchDebounce = null;
   const MAX_RENDERED_CHUNKS = 4;
   const debug = new URLSearchParams(window.location.search).has("debug");
   const logDebug = (...args) => {
@@ -243,7 +263,6 @@
     }
     categories = categories.map((category) => ({
       id: category.id || String(Math.random()),
-      name: category.name || "",
       pattern: category.pattern || "",
       color: category.color || randomColor(),
       hidden: Boolean(category.hidden),
@@ -251,13 +270,10 @@
     }));
     normalizeSolo();
     compileCategories();
-    const config = getFilterConfig();
-    filterMode = config ? config.mode : null;
-    filterPattern = config ? config.pattern : null;
     renderCategoryList();
-    if (filterMode) {
-      scheduleFilterRefresh();
-    }
+    const config = getFilterConfig();
+    const previousFilterMode = filterMode;
+    applyFilterConfigChange(previousFilterMode, config);
   }
 
   function saveCategories() {
@@ -307,29 +323,9 @@
     soloCategoryId = categories.find((category) => category.solo)?.id || null;
     compileCategories();
     const config = getFilterConfig();
-    filterMode = config ? config.mode : null;
-    filterPattern = config ? config.pattern : null;
-    logDebug("filter-config", { filterMode, filterPattern, soloCategoryId });
     saveCategories();
     renderCategoryList();
-    rerenderCurrentView();
-    if (filterMode) {
-      scheduleFilterRefresh();
-    } else if (previousFilterMode) {
-      filterMatchCount = null;
-      filterChunkLines = [];
-      filterChunkLineNumbers = [];
-      filterChunkStart = 0;
-      filterPrefetched = null;
-      filterPrefetchPromise = null;
-      filterPrefetchStart = null;
-      renderedFilterChunks = [];
-      renderedChunks = [];
-      setSpacerHeight();
-      renderChunks();
-      const currentLine = Math.floor(scrollArea.scrollTop / lineHeight);
-      loadChunk(currentLine, { force: true });
-    }
+    applyFilterConfigChange(previousFilterMode, config);
   }
 
   function renderCategoryList() {
@@ -476,7 +472,6 @@
       ...categories,
       {
         id: String(Date.now() + Math.random()),
-        name: "",
         pattern: "",
         color: randomColor(),
         hidden: false,
@@ -484,6 +479,308 @@
       },
     ];
     updateCategories(next);
+  }
+
+  function normalizeSelectedLines(rawLines) {
+    const filtered = rawLines
+      .map((line) => line.replace(/\r/g, ""))
+      .map((line) => line.slice(0, MAX_AI_LINE_LENGTH))
+      .filter((line) => line.trim().length > 0);
+    const sliced = filtered.slice(0, MAX_AI_LINES);
+    let truncated = filtered.length > sliced.length;
+    let remaining = MAX_AI_TOTAL_CHARS;
+    const lines = [];
+    sliced.forEach((line) => {
+      if (remaining <= 0) {
+        truncated = true;
+        return;
+      }
+      const portion = line.slice(0, remaining);
+      if (portion.length !== line.length) {
+        truncated = true;
+      }
+      lines.push(portion);
+      remaining -= portion.length;
+    });
+    return { lines, truncated };
+  }
+
+  function captureSelectedLines() {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) {
+      return { lines: [], truncated: false };
+    }
+    const range = selection.getRangeAt(0);
+    const insideLog =
+      logContent.contains(range.startContainer) && logContent.contains(range.endContainer);
+    if (!insideLog) {
+      return { lines: [], truncated: false };
+    }
+    const text = selection.toString() || "";
+    const rawLines = text.split("\n");
+    return normalizeSelectedLines(rawLines);
+  }
+
+  function handleLineCheckboxChange(event) {
+    const target = event.target;
+    if (!target || target.type !== "checkbox" || !target.classList.contains("line-select")) {
+      return;
+    }
+    const lineNo = Number(target.dataset.line);
+    if (Number.isNaN(lineNo)) {
+      return;
+    }
+    const row = target.closest(".log-line-row");
+    const lineSpan = row ? row.querySelector(".log-line") : null;
+    const lineText = lineSpan ? lineSpan.textContent || "" : "";
+    if (target.checked) {
+      selectedLines.set(lineNo, lineText);
+    } else {
+      selectedLines.delete(lineNo);
+    }
+    if (aiSuggestButton) {
+      aiSuggestButton.disabled = selectedLines.size === 0;
+    }
+  }
+
+  function closeAiDialog() {
+    if (!aiDialog) {
+      return;
+    }
+    aiDialog.hidden = true;
+    aiSelectionLines = [];
+    aiSuggestions = [];
+    aiSelectedPattern = null;
+    aiRequestInFlight = false;
+    if (aiSuggestionList) {
+      aiSuggestionList.innerHTML = "";
+    }
+    if (aiSuggestionStatus) {
+      aiSuggestionStatus.textContent = "Choose lines in the log, then request suggestions.";
+    }
+    if (aiApplyButton) {
+      aiApplyButton.disabled = true;
+    }
+  }
+
+  function selectAiSuggestion(pattern, element) {
+    aiSelectedPattern = pattern;
+    if (aiSuggestionList) {
+      const children = aiSuggestionList.querySelectorAll(".ai-suggestion");
+      children.forEach((node) => {
+        node.classList.toggle("is-selected", node === element);
+      });
+    }
+    if (aiApplyButton) {
+      aiApplyButton.disabled = !aiSelectedPattern;
+    }
+  }
+
+  function renderAiSuggestions(rejected, totalReturned) {
+    if (!aiSuggestionList || !aiSuggestionStatus) {
+      return;
+    }
+    aiSuggestionList.innerHTML = "";
+    if (!aiSuggestions || aiSuggestions.length === 0) {
+      const hadResults = typeof totalReturned === "number" && totalReturned > 0;
+      const message = hadResults
+        ? "No suggestions matched all selected lines."
+        : "No suggestions returned. Try selecting a different slice of lines.";
+      aiSuggestionStatus.textContent = message;
+      if (aiApplyButton) {
+        aiApplyButton.disabled = true;
+      }
+      return;
+    }
+    if (aiApplyButton) {
+      aiApplyButton.disabled = !aiSelectedPattern;
+    }
+    if (typeof rejected === "number" && rejected > 0) {
+      aiSuggestionStatus.textContent = `${aiSuggestions.length} patterns match all selected lines (${rejected} discarded).`;
+    } else {
+      aiSuggestionStatus.textContent = `${aiSuggestions.length} patterns match all selected lines.`;
+    }
+    aiSuggestions.forEach((pattern, index) => {
+      const entry = document.createElement("button");
+      entry.type = "button";
+      entry.className = "ai-suggestion";
+      entry.dataset.pattern = pattern;
+      const text = document.createElement("div");
+      text.className = "ai-suggestion-text";
+      text.textContent = pattern;
+      const meta = document.createElement("div");
+      meta.className = "ai-suggestion-meta";
+      meta.textContent = `Option ${index + 1}`;
+      entry.appendChild(text);
+      entry.appendChild(meta);
+      entry.onclick = () => selectAiSuggestion(pattern, entry);
+      aiSuggestionList.appendChild(entry);
+    });
+  }
+
+  async function requestAiSuggestions() {
+    if (!aiSelectionLines || aiSelectionLines.length === 0) {
+      if (aiSuggestionStatus) {
+        aiSuggestionStatus.textContent = "Select some log lines first.";
+      }
+      return;
+    }
+    if (aiRequestInFlight) {
+      return;
+    }
+    aiRequestInFlight = true;
+    aiSuggestions = [];
+    aiSelectedPattern = null;
+    if (aiApplyButton) {
+      aiApplyButton.disabled = true;
+    }
+    if (aiSuggestionList) {
+      aiSuggestionList.innerHTML = "";
+    }
+    if (aiSuggestionStatus) {
+      aiSuggestionStatus.textContent = "Requesting suggestions...";
+    }
+    try {
+      const response = await fetch("/api/ai-suggest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lines: aiSelectionLines }),
+      });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (err) {
+        payload = null;
+      }
+      if (!response.ok) {
+        const message = payload && payload.error ? payload.error : "Failed to fetch suggestions";
+        throw new Error(message);
+      }
+      if (aiDialog && aiDialog.hidden) {
+        return;
+      }
+      aiSuggestions = Array.isArray(payload?.suggestions)
+        ? payload.suggestions.filter((entry) => typeof entry === "string")
+        : [];
+      aiSuggestions = Array.from(new Set(aiSuggestions));
+      const rejected = typeof payload?.rejected === "number" ? payload.rejected : 0;
+      const totalReturned =
+        typeof payload?.totalReturned === "number"
+          ? payload.totalReturned
+          : aiSuggestions.length;
+      renderAiSuggestions(rejected, totalReturned);
+    } catch (err) {
+      if (aiSuggestionStatus) {
+        aiSuggestionStatus.textContent = err && err.message ? err.message : "Request failed";
+      }
+    } finally {
+      aiRequestInFlight = false;
+    }
+  }
+
+  function openAiDialogFromSelection() {
+    if (!aiDialog || !aiSelection || !aiSuggestionStatus) {
+      return;
+    }
+    if (selectedLines.size === 0) {
+      return;
+    }
+    const ordered = Array.from(selectedLines.entries()).sort((a, b) => a[0] - b[0]);
+    const captured = normalizeSelectedLines(ordered.map((entry) => entry[1] || ""));
+    aiSelectionLines = captured.lines;
+    aiSelectedPattern = null;
+    aiSuggestions = [];
+    aiSelection.textContent =
+      aiSelectionLines.length > 0 ? aiSelectionLines.join("\n") : "(no lines selected)";
+    if (aiSuggestionList) {
+      aiSuggestionList.innerHTML = "";
+    }
+    if (aiApplyButton) {
+      aiApplyButton.disabled = true;
+    }
+    aiDialog.hidden = false;
+    if (captured.lines.length === 0) {
+      aiSuggestionStatus.textContent =
+        "No selected lines. Check the boxes beside log lines, then try again.";
+      return;
+    }
+    if (captured.truncated) {
+      aiSuggestionStatus.textContent = "Selection truncated; requesting suggestions...";
+    } else {
+      aiSuggestionStatus.textContent = "Requesting suggestions...";
+    }
+    requestAiSuggestions();
+  }
+
+  function applySelectedSuggestion() {
+    if (!aiSelectedPattern) {
+      return;
+    }
+    const next = [
+      ...categories,
+      {
+        id: String(Date.now() + Math.random()),
+        pattern: aiSelectedPattern,
+        color: randomColor(),
+        hidden: false,
+        solo: false,
+      },
+    ];
+    updateCategories(next);
+    closeAiDialog();
+  }
+
+  function resetFilterState() {
+    filterMatchCount = null;
+    filterChunkLines = [];
+    filterChunkLineNumbers = [];
+    filterChunkStart = 0;
+    filterPrefetched = null;
+    filterPrefetchPromise = null;
+    filterPrefetchStart = null;
+    renderedFilterChunks = [];
+  }
+
+  function applyFilterConfigChange(previousFilterMode, config) {
+    filterMode = config ? config.mode : null;
+    filterPattern = config ? config.includePattern || config.excludePattern || null : null;
+    logDebug("filter-config", { filterMode, filterPattern, soloCategoryId, searchPattern });
+    if (filterMode) {
+      resetFilterState();
+      renderedChunks = [];
+      renderChunks();
+      scheduleFilterRefresh();
+      return;
+    }
+    if (previousFilterMode) {
+      resetFilterState();
+      renderedChunks = [];
+      setSpacerHeight();
+      renderChunks();
+      const currentLine = Math.floor(scrollArea.scrollTop / lineHeight);
+      loadChunk(currentLine, { force: true });
+      return;
+    }
+    rerenderCurrentView();
+  }
+
+  function applySearch(value) {
+    const previousFilterMode = filterMode;
+    searchPattern = value.trim();
+    const config = getFilterConfig();
+    applyFilterConfigChange(previousFilterMode, config);
+  }
+
+  function onSearchInput() {
+    if (!searchInput) {
+      return;
+    }
+    if (searchDebounce) {
+      clearTimeout(searchDebounce);
+    }
+    searchDebounce = setTimeout(() => {
+      applySearch(searchInput.value || "");
+    }, 200);
   }
 
   function scheduleFilterRefresh() {
@@ -513,42 +810,23 @@
       return;
     }
     soloCategoryId = category.id;
-    filterMode = "include";
-    filterPattern = category.pattern;
-    filterMatchCount = null;
-    filterChunkLines = [];
-    filterChunkLineNumbers = [];
-    filterChunkStart = 0;
-    currentRangeStart = 0;
-    currentRangeEnd = 0;
-    renderedChunks = [];
-    renderedFilterChunks = [];
-    scrollArea.scrollTop = 0;
-    await fetchMatchCount();
-    setSpacerHeight();
-    renderChunks();
-    await loadFilteredChunk(0, { force: true });
+    const previousFilterMode = filterMode;
+    const config = getFilterConfig();
+    applyFilterConfigChange(previousFilterMode, config);
   }
 
   async function deactivateSolo() {
+    const previousFilterMode = filterMode;
     soloCategoryId = null;
-    filterMode = null;
-    filterPattern = null;
-    filterMatchCount = null;
-    filterChunkLines = [];
-    filterChunkLineNumbers = [];
-    filterChunkStart = 0;
-    renderedChunks = [];
-    renderedFilterChunks = [];
-    currentRangeStart = 0;
-    currentRangeEnd = 0;
     const config = getFilterConfig();
     if (config) {
-      filterMode = config.mode;
-      filterPattern = config.pattern;
-      scheduleFilterRefresh();
+      applyFilterConfigChange(previousFilterMode, config);
       return;
     }
+    resetFilterState();
+    renderedChunks = [];
+    currentRangeStart = 0;
+    currentRangeEnd = 0;
     setSpacerHeight();
     renderChunks();
     if (soloRestoreScrollTop != null) {
@@ -590,7 +868,7 @@
       }
       const safeLine = line.length === 0 ? "&nbsp;" : escapeHtml(line);
       contentBuffer.push(
-        `<span class="${classes.join(" ")}"${style}>${safeLine}</span>`
+        `<label class="log-line-row"><input type="checkbox" class="line-select"${selectedLines.has(lineNo) ? " checked" : ""} data-line="${lineNo}" /><span class="${classes.join(" ")}"${style}>${safeLine}</span></label>`
       );
       lineNumbersList.push(lineNo);
     });
@@ -718,10 +996,12 @@
           classes.push("marked");
           style = ` style="--mark-color: ${color}"`;
         }
+        const lineNo = lineNumbersList[index];
         const safeLine = line.length === 0 ? "&nbsp;" : escapeHtml(line);
-        htmlParts.push(`<span class="${classes.join(" ")}"${style}>${safeLine}</span>`);
+        htmlParts.push(
+          `<label class="log-line-row"><input type="checkbox" class="line-select"${selectedLines.has(lineNo) ? " checked" : ""} data-line="${lineNo}" /><span class="${classes.join(" ")}"${style}>${safeLine}</span></label>`
+        );
         if (lineNumbersEnabled) {
-          const lineNo = lineNumbersList[index];
           lineNumberParts.push(String(lineNo).padStart(width, " "));
         }
       });
@@ -819,12 +1099,12 @@
         classes.push("marked");
         style = ` style="--mark-color: ${color}"`;
       }
+      const lineNo = lineNumbersList[index];
       const safeLine = line.length === 0 ? "&nbsp;" : escapeHtml(line);
       contentBuffer.push(
-        `<span class="${classes.join(" ")}"${style}>${safeLine}</span>`
+        `<label class="log-line-row"><input type="checkbox" class="line-select"${selectedLines.has(lineNo) ? " checked" : ""} data-line="${lineNo}" /><span class="${classes.join(" ")}"${style}>${safeLine}</span></label>`
       );
       if (lineNumbersEnabled) {
-        const lineNo = lineNumbersList[index];
         lineNumbersBuffer.push(String(lineNo).padStart(width, " "));
       }
     });
@@ -902,19 +1182,35 @@
     const soloMatcher = categoryMatchers.find(
       (matcher) => matcher.category.id === soloCategory?.id
     );
-    if (soloCategory && soloCategory.pattern && soloMatcher && soloMatcher.regex) {
-      return {
-        mode: "include",
-        pattern: soloCategory.pattern,
-        highlightId: soloCategory.id,
-      };
-    }
     const hidden = categoryMatchers
       .filter((matcher) => matcher.category.hidden && matcher.regex)
       .map((matcher) => matcher.category);
-    if (hidden.length > 0) {
-      const pattern = hidden.map((item) => `(?:${item.pattern})`).join("|");
-      return { mode: "exclude", pattern, highlightId: null };
+    const hiddenPattern =
+      hidden.length > 0 ? hidden.map((item) => `(?:${item.pattern})`).join("|") : "";
+    const searchValue = searchPattern ? searchPattern.trim() : "";
+
+    let includePattern = "";
+    let highlightId = null;
+    if (soloCategory && soloCategory.pattern && soloMatcher && soloMatcher.regex) {
+      includePattern = soloCategory.pattern;
+      highlightId = soloCategory.id;
+    }
+    if (searchValue) {
+      includePattern = includePattern
+        ? `(?=${searchValue})${includePattern}`
+        : searchValue;
+    }
+
+    if (includePattern) {
+      return {
+        mode: "include",
+        includePattern,
+        excludePattern: hiddenPattern || null,
+        highlightId,
+      };
+    }
+    if (hiddenPattern) {
+      return { mode: "exclude", excludePattern: hiddenPattern, highlightId: null };
     }
     return null;
   }
@@ -922,11 +1218,14 @@
   async function fetchFilteredChunk(startMatch) {
     const chunkLines = meta.chunkLines || 200;
     const config = getFilterConfig();
-    const pattern = config ? config.pattern : "";
+    const includePattern = config ? config.includePattern || "" : "";
+    const excludePattern = config ? config.excludePattern || "" : "";
     const mode = config ? config.mode : "include";
     const url = `/api/filter?file=${encodeURIComponent(
       currentFileId || ""
-    )}&pattern=${encodeURIComponent(pattern)}&mode=${encodeURIComponent(
+    )}&include=${encodeURIComponent(includePattern)}&exclude=${encodeURIComponent(
+      excludePattern
+    )}&mode=${encodeURIComponent(
       mode
     )}&startMatch=${startMatch}&matches=${chunkLines}&charset=${encodeURIComponent(
       currentCharset || ""
@@ -940,13 +1239,15 @@
 
   async function fetchMatchCount() {
     const config = getFilterConfig();
-    if (!config || !config.pattern) {
+    if (!config || (!config.includePattern && !config.excludePattern)) {
       filterMatchCount = 0;
       return;
     }
     const url = `/api/match-count?file=${encodeURIComponent(
       currentFileId || ""
-    )}&pattern=${encodeURIComponent(config.pattern)}&mode=${encodeURIComponent(
+    )}&include=${encodeURIComponent(config.includePattern || "")}&exclude=${encodeURIComponent(
+      config.excludePattern || ""
+    )}&mode=${encodeURIComponent(
       config.mode
     )}&charset=${encodeURIComponent(
       currentCharset || ""
@@ -1256,6 +1557,10 @@
       currentRangeEnd = 0;
       renderedChunks = [];
       renderedFilterChunks = [];
+      selectedLines.clear();
+      if (aiSuggestButton) {
+        aiSuggestButton.disabled = true;
+      }
       prefetched = null;
       prefetchPromise = null;
       pendingStart = null;
@@ -1287,6 +1592,10 @@
       currentRangeEnd = 0;
       renderedChunks = [];
       renderedFilterChunks = [];
+      selectedLines.clear();
+      if (aiSuggestButton) {
+        aiSuggestButton.disabled = true;
+      }
       queuedStart = null;
       prefetched = null;
       prefetchPromise = null;
@@ -1368,6 +1677,42 @@
       if (addCategoryButton) {
         addCategoryButton.onclick = addCategory;
       }
+      if (searchInput) {
+        searchInput.addEventListener("input", onSearchInput);
+      }
+      if (aiSuggestButton) {
+        aiSuggestButton.onclick = openAiDialogFromSelection;
+        aiSuggestButton.disabled = selectedLines.size === 0;
+      }
+      if (aiCloseButton) {
+        aiCloseButton.onclick = closeAiDialog;
+      }
+      if (aiRefreshButton) {
+        aiRefreshButton.onclick = () => {
+          requestAiSuggestions();
+        };
+      }
+      if (aiApplyButton) {
+        aiApplyButton.onclick = applySelectedSuggestion;
+      }
+      if (aiDialog) {
+        aiDialog.addEventListener("click", (event) => {
+          if (event.target === aiDialog) {
+            closeAiDialog();
+          }
+        });
+      }
+      if (aiDialogBackdrop) {
+        aiDialogBackdrop.onclick = () => closeAiDialog();
+      }
+      if (logContent) {
+        logContent.addEventListener("change", handleLineCheckboxChange);
+      }
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && aiDialog && !aiDialog.hidden) {
+          closeAiDialog();
+        }
+      });
       if (!meta.lineCountReady) {
         metaPollTimer = setTimeout(refreshMeta, 1000);
       }
