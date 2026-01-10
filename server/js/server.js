@@ -168,6 +168,7 @@ function readFilteredMatches({
   matchLimit,
   charset,
   mode,
+  minLine,
   verbose,
 }) {
   const includeSource = includePattern || (mode === "exclude" ? "" : pattern) || "";
@@ -201,6 +202,9 @@ function readFilteredMatches({
   let stopped = false;
 
   return scanFileLines(filePath, charset, (line, lineNo) => {
+    if (minLine && lineNo <= minLine) {
+      return true;
+    }
     if (includeRegex && includeRegex.global) {
       includeRegex.lastIndex = 0;
     }
@@ -242,6 +246,7 @@ function countMatches({
   pattern,
   charset,
   mode,
+  minLine,
   verbose,
 }) {
   const includeSource = includePattern || (mode === "exclude" ? "" : pattern) || "";
@@ -269,7 +274,10 @@ function countMatches({
   }
 
   let count = 0;
-  return scanFileLines(filePath, charset, (line) => {
+  return scanFileLines(filePath, charset, (line, lineNo) => {
+    if (minLine && lineNo <= minLine) {
+      return true;
+    }
     if (includeRegex && includeRegex.global) {
       includeRegex.lastIndex = 0;
     }
@@ -545,6 +553,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
         filePath: selected.path,
         fileName: selected.name,
         fileSize: stat.size,
+        fileMtimeMs: stat.mtimeMs,
         lineIndex: buildLineIndex(selected.path, verbose),
       });
     }
@@ -601,6 +610,13 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
         if (!selected) {
           send(res, 400, "Unknown file");
           return;
+        }
+        const stat = fs.statSync(selected.filePath);
+        if (stat.size !== selected.fileSize || stat.mtimeMs !== selected.fileMtimeMs) {
+          selected.fileSize = stat.size;
+          selected.fileMtimeMs = stat.mtimeMs;
+          selected.lineIndex = buildLineIndex(selected.filePath, verbose);
+          MATCH_COUNT_CACHE.clear();
         }
         const payload = JSON.stringify({
           fileId: fileId,
@@ -675,6 +691,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
         const mode = parsed.searchParams.get("mode") || "include";
         const startMatch = Number(parsed.searchParams.get("startMatch") || 0);
         const matchLimit = Number(parsed.searchParams.get("matches") || CHUNK_LINES);
+        const minLine = Number(parsed.searchParams.get("minLine") || 0);
         const charsetParam = normalizeCharset(
           parsed.searchParams.get("charset") || defaultCharset
         );
@@ -689,7 +706,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
           send(res, 400, "Missing pattern");
           return;
         }
-        if (Number.isNaN(startMatch) || Number.isNaN(matchLimit)) {
+        if (Number.isNaN(startMatch) || Number.isNaN(matchLimit) || Number.isNaN(minLine)) {
           send(res, 400, "Invalid startMatch or matches");
           return;
         }
@@ -703,6 +720,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
             matchLimit: Math.max(1, Math.min(matchLimit, CHUNK_LINES * 2)),
             charset: charsetParam,
             mode,
+            minLine: Math.max(0, minLine),
             verbose,
           });
           send(res, 200, JSON.stringify(result), "application/json; charset=utf-8");
@@ -727,6 +745,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
         const excludePattern = parsed.searchParams.get("exclude") || "";
         const pattern = parsed.searchParams.get("pattern") || "";
         const mode = parsed.searchParams.get("mode") || "include";
+        const minLine = Number(parsed.searchParams.get("minLine") || 0);
         const charsetParam = normalizeCharset(
           parsed.searchParams.get("charset") || defaultCharset
         );
@@ -740,7 +759,11 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
           send(res, 400, "Missing pattern");
           return;
         }
-        const cacheKey = `${selected.filePath}::${charsetParam}::${mode}::include:${include}::exclude:${exclude}`;
+        if (Number.isNaN(minLine)) {
+          send(res, 400, "Invalid minLine");
+          return;
+        }
+        const cacheKey = `${selected.filePath}::${charsetParam}::${mode}::minLine:${minLine}::include:${include}::exclude:${exclude}`;
         if (MATCH_COUNT_CACHE.has(cacheKey)) {
           const cached = MATCH_COUNT_CACHE.get(cacheKey);
           send(res, 200, JSON.stringify({ count: cached }), "application/json; charset=utf-8");
@@ -754,6 +777,7 @@ function start({ port, filePaths, wrap, verbose, charset, lineNumbers }) {
             pattern,
             charset: charsetParam,
             mode,
+            minLine: Math.max(0, minLine),
             verbose,
           });
           MATCH_COUNT_CACHE.set(cacheKey, count);

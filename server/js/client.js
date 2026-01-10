@@ -13,6 +13,8 @@
   const fileSelect = document.getElementById("file-select");
   const lineNumbersToggle = document.getElementById("line-numbers-toggle");
   const searchInput = document.getElementById("search-input");
+  const tailModeSelect = document.getElementById("tail-mode");
+  const uncategorizedToggle = document.getElementById("uncategorized-toggle");
   const addCategoryButton = document.getElementById("add-category");
   const categoryList = document.getElementById("category-list");
   const categoryEmpty = document.getElementById("category-empty");
@@ -29,6 +31,11 @@
   const ESTIMATED_BYTES_PER_LINE = 80;
   const CATEGORY_STORAGE_PREFIX =
     "net.stoerr.Categorizedlogfileviewer.categories.com";
+  const HIDE_UNCATEGORIZED_STORAGE_KEY =
+    "net.stoerr.Categorizedlogfileviewer.hideUncategorized";
+  const TAIL_MODE_STORAGE_KEY = "net.stoerr.Categorizedlogfileviewer.tailMode";
+  const TAIL_POLL_INTERVAL_MS = 2000;
+  const TAIL_MODES = ["snapshot", "follow", "since-open"];
   const MAX_AI_LINES = 50;
   const MAX_AI_TOTAL_CHARS = 8000;
   const MAX_AI_LINE_LENGTH = 1000;
@@ -71,6 +78,11 @@
   let selectedLines = new Map();
   let searchPattern = "";
   let searchDebounce = null;
+  let hideUncategorized = false;
+  let tailMode = "snapshot";
+  let tailPollTimer = null;
+  let tailUpdateInFlight = false;
+  let sinceOpenBaseLine = null;
   const MAX_RENDERED_CHUNKS = 4;
   const debug = new URLSearchParams(window.location.search).has("debug");
   const logDebug = (...args) => {
@@ -79,6 +91,16 @@
     }
   };
   logDebug("debug-enabled");
+
+  function getViewBaseLine() {
+    if (tailMode !== "since-open") {
+      return 0;
+    }
+    if (typeof sinceOpenBaseLine !== "number") {
+      return 0;
+    }
+    return Math.max(0, sinceOpenBaseLine);
+  }
 
   function formatBytes(bytes) {
     if (bytes < 1024) {
@@ -137,10 +159,13 @@
       }
       return Math.max(1, currentRangeEnd - currentRangeStart);
     }
+    const baseLine = getViewBaseLine();
     if (meta.lineCount != null) {
-      return Math.max(1, meta.lineCount);
+      const visible = Math.max(0, meta.lineCount - baseLine);
+      return Math.max(1, visible);
     }
-    return Math.max(1, Math.ceil(meta.fileSize / ESTIMATED_BYTES_PER_LINE));
+    const estimate = Math.ceil(meta.fileSize / ESTIMATED_BYTES_PER_LINE);
+    return Math.max(1, estimate);
   }
 
   function getCurrentChunkSpan() {
@@ -849,7 +874,7 @@
     const contentBuffer = [];
 
     lines.forEach((line, index) => {
-      const lineNo = chunk.start + index + 1;
+      const lineNo = chunk.start + index + 1 + getViewBaseLine();
       const matches = categoryMatchers.filter((matcher) => {
         if (!matcher.regex) {
           return false;
@@ -873,7 +898,9 @@
       lineNumbersList.push(lineNo);
     });
 
-    const totalLines = meta && meta.lineCount != null ? meta.lineCount : chunk.start + lines.length;
+    const baseLine = getViewBaseLine();
+    const totalLines =
+      meta && meta.lineCount != null ? meta.lineCount : chunk.start + lines.length + baseLine;
     const width = String(Math.max(1, totalLines)).length;
     const lineNumbersText = lineNumbersEnabled
       ? lineNumbersList.map((lineNo) => String(lineNo).padStart(width, " ")).join("\n")
@@ -1129,9 +1156,10 @@
   }
 
   function buildRangeLabel(startLine, lineCount) {
+    const baseLine = getViewBaseLine();
     const endLine = startLine + Math.max(0, lineCount - 1);
-    const startLabel = startLine + 1;
-    const endLabel = Math.max(startLabel, endLine + 1);
+    const startLabel = startLine + 1 + baseLine;
+    const endLabel = Math.max(startLabel, endLine + 1 + baseLine);
     if (meta && meta.lineCount != null) {
       return `Lines ${startLabel.toLocaleString()} - ${endLabel.toLocaleString()} of ${meta.lineCount.toLocaleString()}`;
     }
@@ -1165,9 +1193,11 @@
 
   async function fetchChunk(startLine) {
     const chunkLines = meta.chunkLines || 200;
+    const baseLine = getViewBaseLine();
+    const fileLine = startLine + baseLine;
     const url = `/api/chunk?file=${encodeURIComponent(
       currentFileId || ""
-    )}&line=${startLine}&lines=${chunkLines}&charset=${encodeURIComponent(
+    )}&line=${fileLine}&lines=${chunkLines}&charset=${encodeURIComponent(
       currentCharset || ""
     )}`;
     const response = await fetch(url, { cache: "no-store" });
@@ -1187,6 +1217,13 @@
       .map((matcher) => matcher.category);
     const hiddenPattern =
       hidden.length > 0 ? hidden.map((item) => `(?:${item.pattern})`).join("|") : "";
+    const categorizedPatterns = categoryMatchers
+      .filter((matcher) => matcher.regex && matcher.category.pattern)
+      .map((matcher) => matcher.category.pattern);
+    const categorizedPattern =
+      categorizedPatterns.length > 0
+        ? categorizedPatterns.map((pattern) => `(?:${pattern})`).join("|")
+        : "";
     const searchValue = searchPattern ? searchPattern.trim() : "";
 
     let includePattern = "";
@@ -1194,6 +1231,8 @@
     if (soloCategory && soloCategory.pattern && soloMatcher && soloMatcher.regex) {
       includePattern = soloCategory.pattern;
       highlightId = soloCategory.id;
+    } else if (hideUncategorized) {
+      includePattern = categorizedPattern || "(?!)";
     }
     if (searchValue) {
       includePattern = includePattern
@@ -1221,6 +1260,9 @@
     const includePattern = config ? config.includePattern || "" : "";
     const excludePattern = config ? config.excludePattern || "" : "";
     const mode = config ? config.mode : "include";
+    const minLine = getViewBaseLine();
+    const minLineParam =
+      tailMode === "since-open" && minLine > 0 ? `&minLine=${minLine}` : "";
     const url = `/api/filter?file=${encodeURIComponent(
       currentFileId || ""
     )}&include=${encodeURIComponent(includePattern)}&exclude=${encodeURIComponent(
@@ -1229,7 +1271,7 @@
       mode
     )}&startMatch=${startMatch}&matches=${chunkLines}&charset=${encodeURIComponent(
       currentCharset || ""
-    )}`;
+    )}${minLineParam}`;
     const response = await fetch(url, { cache: "no-store" });
     if (!response.ok) {
       throw new Error("Filtered fetch failed");
@@ -1243,6 +1285,9 @@
       filterMatchCount = 0;
       return;
     }
+    const minLine = getViewBaseLine();
+    const minLineParam =
+      tailMode === "since-open" && minLine > 0 ? `&minLine=${minLine}` : "";
     const url = `/api/match-count?file=${encodeURIComponent(
       currentFileId || ""
     )}&include=${encodeURIComponent(config.includePattern || "")}&exclude=${encodeURIComponent(
@@ -1251,7 +1296,7 @@
       config.mode
     )}&charset=${encodeURIComponent(
       currentCharset || ""
-    )}`;
+    )}${minLineParam}`;
     const response = await fetch(url, { cache: "no-store" });
     if (!response.ok) {
       return;
@@ -1538,6 +1583,164 @@
     });
   }
 
+  function normalizeTailMode(value) {
+    if (TAIL_MODES.includes(value)) {
+      return value;
+    }
+    return "snapshot";
+  }
+
+  function readStorageValue(key) {
+    try {
+      return localStorage.getItem(key);
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function writeStorageValue(key, value) {
+    try {
+      localStorage.setItem(key, value);
+    } catch (err) {
+      // Ignore storage failures.
+    }
+  }
+
+  function setHideUncategorized(nextValue) {
+    const previousFilterMode = filterMode;
+    hideUncategorized = Boolean(nextValue);
+    writeStorageValue(HIDE_UNCATEGORIZED_STORAGE_KEY, hideUncategorized ? "1" : "0");
+    if (uncategorizedToggle) {
+      uncategorizedToggle.checked = hideUncategorized;
+    }
+    const config = getFilterConfig();
+    applyFilterConfigChange(previousFilterMode, config);
+  }
+
+  function resetViewState() {
+    resetFilterState();
+    renderedChunks = [];
+    renderedFilterChunks = [];
+    currentRangeStart = 0;
+    currentRangeEnd = 0;
+    selectedLines.clear();
+    if (aiSuggestButton) {
+      aiSuggestButton.disabled = true;
+    }
+  }
+
+  function resetViewForTailMode() {
+    resetViewState();
+    setSpacerHeight();
+    const previousFilterMode = filterMode;
+    const config = getFilterConfig();
+    applyFilterConfigChange(previousFilterMode, config);
+    if (!filterMode) {
+      renderChunks();
+      loadChunk(0, { force: true });
+    }
+  }
+
+  function setTailMode(nextMode, options) {
+    const normalized = normalizeTailMode(nextMode);
+    if (tailMode === normalized && !(options && options.force)) {
+      return;
+    }
+    tailMode = normalized;
+    writeStorageValue(TAIL_MODE_STORAGE_KEY, tailMode);
+    if (tailModeSelect) {
+      tailModeSelect.value = tailMode;
+    }
+    if (tailMode === "since-open") {
+      sinceOpenBaseLine = meta && meta.lineCount != null ? meta.lineCount : null;
+    } else {
+      sinceOpenBaseLine = null;
+    }
+    if (meta) {
+      resetViewForTailMode();
+    }
+    updateTailPolling();
+  }
+
+  function applyTailModeSelect() {
+    if (!tailModeSelect) {
+      return;
+    }
+    tailModeSelect.value = tailMode;
+    tailModeSelect.addEventListener("change", () => {
+      setTailMode(tailModeSelect.value);
+    });
+  }
+
+  function applyHideUncategorizedToggle() {
+    if (!uncategorizedToggle) {
+      return;
+    }
+    uncategorizedToggle.checked = hideUncategorized;
+    uncategorizedToggle.addEventListener("change", () => {
+      setHideUncategorized(uncategorizedToggle.checked);
+    });
+  }
+
+  function isNearBottom() {
+    if (!scrollArea) {
+      return false;
+    }
+    const threshold = lineHeight * 2;
+    return scrollArea.scrollTop + scrollArea.clientHeight >= scrollArea.scrollHeight - threshold;
+  }
+
+  async function checkTailUpdates() {
+    if (!meta || tailUpdateInFlight) {
+      return;
+    }
+    tailUpdateInFlight = true;
+    const previousLineCount = meta.lineCount;
+    const previousFileSize = meta.fileSize;
+    const stickToBottom = isNearBottom();
+    try {
+      await refreshMeta();
+      if (tailMode === "since-open" && sinceOpenBaseLine == null && meta.lineCount != null) {
+        sinceOpenBaseLine = meta.lineCount;
+        resetViewForTailMode();
+        return;
+      }
+      const lineCountChanged =
+        typeof previousLineCount === "number" &&
+        typeof meta.lineCount === "number" &&
+        meta.lineCount > previousLineCount;
+      const fileSizeChanged = meta.fileSize !== previousFileSize;
+      if (!lineCountChanged && !fileSizeChanged) {
+        return;
+      }
+      setSpacerHeight();
+      if (filterMode) {
+        await fetchMatchCount();
+        return;
+      }
+      if (stickToBottom) {
+        const chunkSpan = meta.chunkLines || 200;
+        const totalLines = getEffectiveLineCount();
+        const startLine = Math.max(0, totalLines - chunkSpan);
+        await loadChunk(startLine, { force: true });
+        scrollArea.scrollTop = scrollArea.scrollHeight;
+      }
+    } finally {
+      tailUpdateInFlight = false;
+    }
+  }
+
+  function updateTailPolling() {
+    if (tailPollTimer) {
+      clearInterval(tailPollTimer);
+      tailPollTimer = null;
+    }
+    if (tailMode === "snapshot") {
+      return;
+    }
+    tailPollTimer = setInterval(checkTailUpdates, TAIL_POLL_INTERVAL_MS);
+  }
+
   function populateCharsetOptions() {
     if (!charsetSelect || !meta || !Array.isArray(meta.charsetOptions)) {
       return;
@@ -1560,6 +1763,9 @@
       selectedLines.clear();
       if (aiSuggestButton) {
         aiSuggestButton.disabled = true;
+      }
+      if (tailMode === "since-open") {
+        sinceOpenBaseLine = null;
       }
       prefetched = null;
       prefetchPromise = null;
@@ -1607,6 +1813,9 @@
       filterChunkLines = [];
       filterChunkLineNumbers = [];
       filterChunkStart = 0;
+      if (tailMode === "since-open") {
+        sinceOpenBaseLine = null;
+      }
       scrollArea.scrollTop = 0;
       renderChunks();
       await refreshMeta();
@@ -1631,6 +1840,11 @@
       }
       updateFileMeta();
       setSpacerHeight();
+      if (tailMode === "since-open" && sinceOpenBaseLine == null && meta.lineCount != null) {
+        sinceOpenBaseLine = meta.lineCount;
+        resetViewForTailMode();
+        return;
+      }
       populateFileOptions();
       if (meta.lineCountReady) {
         if (metaPollTimer) {
@@ -1654,6 +1868,11 @@
       meta = await response.json();
       currentCharset = meta.charset;
       currentFileId = meta.fileId;
+      tailMode = normalizeTailMode(readStorageValue(TAIL_MODE_STORAGE_KEY) || "snapshot");
+      hideUncategorized = ["1", "true"].includes(readStorageValue(HIDE_UNCATEGORIZED_STORAGE_KEY));
+      if (tailMode === "since-open" && meta.lineCount != null) {
+        sinceOpenBaseLine = meta.lineCount;
+      }
       lineNumbersEnabled = Boolean(meta.lineNumbers);
       soloCategoryId = null;
       filterMode = null;
@@ -1672,6 +1891,8 @@
       await loadChunk(0, { force: true });
       applyWrapToggle();
       applyLineNumbersToggle();
+      applyTailModeSelect();
+      applyHideUncategorizedToggle();
       populateCharsetOptions();
       populateFileOptions();
       if (addCategoryButton) {
@@ -1719,6 +1940,7 @@
       scrollArea.addEventListener("scroll", () => {
         window.requestAnimationFrame(onScroll);
       });
+      updateTailPolling();
     } catch (err) {
       fileMeta.textContent = "Failed to load metadata";
     }
